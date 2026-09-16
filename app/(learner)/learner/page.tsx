@@ -1,37 +1,95 @@
 'use client';
 
-import React from 'react';
+interface ScheduleItem {
+  id?: string;
+  task: string;
+  day: string;
+  date: string;
+  time: string;
+  status: string;
+  references: string[];
+}
+
+import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
+import { supabase } from '@/lib/supabaseClient';
 
 export default function LearnerCalendarPage() {
   const router = useRouter();
 
-  const weeklySchedule = [
-    { 
-      day: 'Monday', 
-      date: 'July 13', 
-      task: 'Theories of Personality Mock Exam', 
-      time: '10:00 AM', 
-      status: 'Completed',
-      references: ['Feist & Feist Theories of Personality', 'Cloninger']
-    },
-    { 
-      day: 'Wednesday', 
-      date: 'July 15', 
-      task: 'Abnormal Psychology Diagnostic', 
-      time: '2:00 PM', 
-      status: 'Pending',
-      references: ['Barlow Abnormal Psychology', 'Kaplan & Sadock Synopsis']
-    },
-    { 
-      day: 'Friday', 
-      date: 'July 17', 
-      task: 'Comprehensive Mock Exam Area A', 
-      time: '9:00 AM', 
-      status: 'Upcoming',
-      references: ['PRC Blueprint Syllabus Guide', 'Gregory Testing']
-    },
-  ];
+  const [weeklySchedule, setWeeklySchedule] = useState<ScheduleItem[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    const fetchSchedule = async () => {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) return;
+
+      // Query Exams and join the logged-in user's specific attempts
+      const { data: exams, error } = await supabase
+        .from('Exams')
+        .select(`
+          exam_id,
+          exam_title,
+          schedule_start,
+          references,
+          attempts:"Student Attempts" ( exam_status )
+        `)
+        .order('schedule_start', { ascending: true });
+
+      if (error) {
+        console.error("Error fetching schedule:", error.message);
+        setIsLoading(false);
+        return;
+      }
+
+      // Format the raw database data to match UI requirements
+      const formattedSchedule = exams.map((exam) => {
+        const examDate = new Date(exam.schedule_start);
+        const now = new Date();
+        
+        // Check if the student has an existing attempt record
+        const studentAttempt = exam.attempts?.[0];
+        
+        // Determine the dynamic status
+        let currentStatus = 'Upcoming';
+        if (studentAttempt?.exam_status === 'completed') {
+          currentStatus = 'Completed';
+        } else if (examDate <= now) {
+          currentStatus = 'Pending';
+        }
+
+        return {
+          id: exam.exam_id,
+          task: exam.exam_title,
+          day: examDate.toLocaleDateString('en-US', { weekday: 'long' }),
+          date: examDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric' }),
+          time: examDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
+          status: currentStatus,
+          references: exam.references || ['Standard Syllabus Guide'] // Fallback if no references exist
+        };
+      });
+
+      setWeeklySchedule(formattedSchedule);
+      setIsLoading(false);
+    };
+
+    fetchSchedule();
+  }, []);
+
+const today = new Date();
+  const currentMonthName = today.toLocaleString('en-US', { month: 'long' });
+  const currentYear = today.getFullYear();
+  
+  const daysInMonth = new Date(currentYear, today.getMonth() + 1, 0).getDate();
+  const firstDayOfMonth = new Date(currentYear, today.getMonth(), 1).getDay();
+
+  const examDaysThisMonth = weeklySchedule
+    .filter(schedule => schedule.date.includes(currentMonthName))
+    .map(schedule => {
+      const match = schedule.date.match(/\d+/);
+      return match ? parseInt(match[0]) : null;
+    });
 
   return (
     <div className="space-y-6">
@@ -91,18 +149,26 @@ export default function LearnerCalendarPage() {
         <div className="lg:col-span-1 space-y-6">
           
           <div className="bg-white p-6 rounded-xl border border-slate-100 shadow-sm">
-            <h3 className="font-bold text-slate-800 mb-4">July 2026 Schedule</h3>
+            <h3 className="font-bold text-slate-800 mb-4">{currentMonthName} {currentYear} Schedule</h3>
             <div className="grid grid-cols-7 gap-1 text-center text-xs font-bold text-slate-400 mb-2">
               <div>Su</div><div>Mo</div><div>Tu</div><div>We</div><div>Th</div><div>Fr</div><div>Sa</div>
             </div>
             <div className="grid grid-cols-7 gap-1 text-center text-sm font-bold text-slate-700">
-              <div className="p-1.5"></div><div className="p-1.5"></div><div className="p-1.5"></div>
-              {Array.from({ length: 31 }, (_, i) => i + 1).map(day => {
-                const isExamDate = [13, 15, 17].includes(day);
+              
+              {Array.from({ length: firstDayOfMonth }).map((_, i) => (
+                <div key={`empty-${i}`} className="p-1.5"></div>
+              ))}
+              
+              {Array.from({ length: daysInMonth }, (_, i) => i + 1).map(day => {
+                const isExamDate = examDaysThisMonth.includes(day);
                 return (
                   <div 
                     key={day} 
-                    className={`p-1.5 rounded-md flex items-center justify-center h-8 w-8 mx-auto ${isExamDate ? 'bg-blue-600 text-white shadow-sm ring-2 ring-blue-200 ring-offset-1' : 'hover:bg-slate-100'}`}
+                    className={`p-1.5 rounded-md flex items-center justify-center h-8 w-8 mx-auto ${
+                      isExamDate 
+                        ? 'bg-blue-600 text-white shadow-sm ring-2 ring-blue-200 ring-offset-1' 
+                        : 'hover:bg-slate-100'
+                    }`}
                   >
                     {day}
                   </div>
@@ -114,18 +180,32 @@ export default function LearnerCalendarPage() {
           <div className="bg-white p-6 rounded-xl border border-slate-100 shadow-sm">
             <h3 className="font-bold text-slate-800 mb-4">Weekly Goals Tracker</h3>
             <ul className="space-y-3 text-sm text-slate-600 font-bold">
-              <li className="flex items-start gap-3">
-                <span className="text-emerald-500 mt-0.5">✓</span>
-                <span>Complete the Theories of Personality Mock Exam.</span>
-              </li>
-              <li className="flex items-start gap-3">
-                <span className="text-blue-500 mt-0.5">○</span>
-                <span>Score above 80 percent on the upcoming Abnormal Psychology Diagnostic.</span>
-              </li>
-              <li className="flex items-start gap-3">
-                <span className="text-slate-300 mt-0.5">○</span>
-                <span>Review last week exam errors.</span>
-              </li>
+              
+              {weeklySchedule.length === 0 ? (
+                <li className="text-slate-400 text-xs italic">No scheduled exams this week.</li>
+              ) : (
+                weeklySchedule.map((exam, idx) => (
+                  <li key={idx} className="flex items-start gap-3">
+                    
+                    {/* Dynamic Icon */}
+                    {exam.status === 'Completed' ? (
+                      <span className="text-emerald-500 mt-0.5">✓</span>
+                    ) : exam.status === 'Pending' ? (
+                      <span className="text-blue-500 mt-0.5">○</span>
+                    ) : (
+                      <span className="text-slate-300 mt-0.5">○</span>
+                    )}
+                    
+                    {/* Dynamic Text with strikethrough for completed items */}
+                    <span className={exam.status === 'Completed' ? 'line-through text-slate-400' : 'text-slate-600'}>
+                      {exam.status === 'Completed' 
+                        ? `Complete the ${exam.task}.` 
+                        : `Prepare for the upcoming ${exam.task}.`}
+                    </span>
+                  </li>
+                ))
+              )}
+              
             </ul>
           </div>
 
