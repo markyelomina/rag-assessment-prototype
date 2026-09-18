@@ -121,6 +121,10 @@ export default function ScheduledExamsPage() {
           displayScore = studentAttempt.final_score
             ? `${studentAttempt.final_score}%`
             : "N/A";
+        } else if (studentAttempt?.exam_status === "in_progress") {
+          // New state for attempted but not concluded exams
+          currentStatus = "In Progress";
+          displayScore = studentAttempt.final_score ? `${studentAttempt.final_score}%` : "N/A";
         }
 
         return {
@@ -166,6 +170,19 @@ export default function ScheduledExamsPage() {
               Review your absolute response accuracy metrics below.
             </p>
           </div>
+          <div className="flex flex-col md:flex-row items-center gap-4">
+            {/* 1. Dynamic Retake Button */}
+            {exam?.status === "In Progress" && (
+              <button
+                onClick={() => {
+                  setViewingDashboard(null); // Close dashboard
+                  setSelectedExam(exam.id); // Open start confirmation modal
+                }}
+                className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold rounded-lg transition-colors shadow-sm whitespace-nowrap"
+              >
+                Start Next Attempt
+              </button>
+            )}
           <div className="bg-slate-50 border border-slate-200 p-4 rounded-lg text-center min-w-[140px]">
             <span className="text-3xl font-black text-blue-600 block">
               {exam?.score}
@@ -175,11 +192,12 @@ export default function ScheduledExamsPage() {
             </span>
           </div>
         </div>
+        </div>
 
         <div className="space-y-4">
           <div className="flex items-center justify-between border-b border-slate-200 pb-2">
             <h3 className="font-bold text-slate-700 text-lg">
-              Blackboard Review Deck
+              Review Deck
             </h3>
             <div className="flex gap-2">
               <button
@@ -349,7 +367,7 @@ export default function ScheduledExamsPage() {
                   Cancel
                 </button>
                 <button
-                  onClick={() => router.push("/learner/exams/1/take")}
+                  onClick={() => router.push(`/learner/exams/${examDetails?.id}/take`)}
                   className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold rounded-lg transition-colors"
                 >
                   Confirm and Start
@@ -402,7 +420,7 @@ export default function ScheduledExamsPage() {
                           : "bg-slate-100 text-slate-600"
                       }`}
                     >
-                      {exam.status === "Finished"
+                      {exam.status === "Finished" || exam.status === "In Progress"
                         ? `Score: ${exam.score}`
                         : exam.status}
                     </span>
@@ -430,6 +448,13 @@ export default function ScheduledExamsPage() {
                       className="w-full py-2.5 bg-blue-600 text-white text-sm font-bold rounded-lg hover:bg-blue-700 transition-colors shadow-sm"
                     >
                       Take Exam
+                    </button>
+                  ) : exam.status === "In Progress" ? (
+                    <button
+                      onClick={() => setViewingDashboard(exam.id)}
+                      className="w-full py-2.5 bg-amber-50 text-amber-700 border border-amber-200 text-sm font-bold rounded-lg hover:bg-amber-100 transition-colors shadow-sm"
+                    >
+                      Review & Retake
                     </button>
                   ) : (
                     <button

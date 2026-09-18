@@ -1,18 +1,21 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
-import { useRouter } from 'next/navigation';
+import { useRouter, useParams } from 'next/navigation';
+import { supabase } from '@/lib/supabaseClient';
 
 export default function LearnerActiveExamPage() {
   const router = useRouter();
+  const params = useParams();
   
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showSubmitModal, setShowSubmitModal] = useState(false);
 
-  // Timer logic: Set for 60 minutes (3600 seconds)
-  const [timeLeft, setTimeLeft] = useState(3600);
+  const [isLoading, setIsLoading] = useState(true);
+  const [examTitle, setExamTitle] = useState('Loading Exam...');
+  const [timeLeft, setTimeLeft] = useState(0);
 
   const mockQuestions = [
     { id: 1, text: 'Which of the following is considered a negative symptom of schizophrenia?', options: ['Delusions', 'Hallucinations', 'Avolition', 'Disorganized speech'] },
@@ -22,7 +25,38 @@ export default function LearnerActiveExamPage() {
     { id: 5, text: 'In experimental research, the variable that is manipulated by the researcher is known as the:', options: ['Dependent variable', 'Confounding variable', 'Control variable', 'Independent variable'] },
   ];
 
+  // Fetch the specific exam details using the URL parameter
   useEffect(() => {
+    const fetchExamDetails = async () => {
+      const examId = params?.id; 
+      if (!examId) return;
+
+      const { data: exam, error } = await supabase
+        .from('Exams')
+        .select('exam_title, time_limit_mins')
+        .eq('exam_id', examId)
+        .single();
+
+      if (error || !exam) {
+        console.error("Failed to load exam details");
+        setExamTitle('Error Loading Exam');
+        return;
+      }
+
+      setExamTitle(exam.exam_title);
+      // Convert database minutes into seconds for the countdown
+      setTimeLeft((exam.time_limit_mins || 60) * 60); 
+      setIsLoading(false);
+    };
+
+    fetchExamDetails();
+  }, [params]);
+
+  // Timer logic
+  useEffect(() => {
+    // Prevent the timer from running or auto-submitting while the database is still loading
+    if (isLoading) return;
+
     if (timeLeft <= 0) {
       handleFinalSubmit();
       return;
@@ -33,7 +67,7 @@ export default function LearnerActiveExamPage() {
     }, 1000);
 
     return () => clearInterval(timerInterval);
-  }, [timeLeft]);
+  }, [timeLeft, isLoading]);
 
   const formatTime = (seconds: number) => {
     const h = Math.floor(seconds / 3600);
@@ -89,7 +123,7 @@ export default function LearnerActiveExamPage() {
       
       <header className="bg-white border-b border-slate-200 p-4 sticky top-0 z-30 shadow-sm flex justify-between items-center">
         <div>
-          <h1 className="font-bold text-slate-800 text-lg">Abnormal Psychology Midterm</h1>
+          <h1 className="font-bold text-slate-800 text-lg">{examTitle}</h1>
           <p className="text-xs text-slate-500 font-bold">Do not refresh or close this browser window.</p>
         </div>
         
