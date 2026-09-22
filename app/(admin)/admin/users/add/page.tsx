@@ -2,16 +2,18 @@
 
 import React, { useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { useToast } from '@/components/ui/ToastContext';
 
 export default function AddUserPage() {
   const router = useRouter();
+  const { addToast } = useToast();
+  
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [role, setRole] = useState('Learner / Reviewer');
   const [cohort, setCohort] = useState('');
   
   const [isLoading, setIsLoading] = useState(false);
-  const [showSuccess, setShowSuccess] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -20,27 +22,19 @@ export default function AddUserPage() {
     setErrorMessage('');
 
     try {
-      // Validation check before sending to API
       if (role === 'Learner / Reviewer' && !cohort) {
         throw new Error('Please select a cohort for the learner.');
       }
 
-      // Simulate a backend API call that takes 1.5 seconds
       await new Promise((resolve) => setTimeout(resolve, 1500));
       
-      // Simulate a random network failure for testing purposes
-      // if (Math.random() > 0.7) throw new Error('Network error. Failed to connect to the database.');
+      addToast(`${name} was successfully registered as a ${role}.`, 'success');
+      router.push('/admin/users');
 
-      setShowSuccess(true);
     } catch (error: any) {
       setErrorMessage(error.message || 'An unexpected error occurred. Please try again.');
-    } finally {
       setIsLoading(false);
     }
-  };
-
-  const handleFinish = () => {
-    router.push('/admin/users');
   };
 
   return (
@@ -160,28 +154,6 @@ export default function AddUserPage() {
           </button>
         </div>
       </form>
-
-      {showSuccess && (
-        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-in fade-in duration-200">
-          <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-8 text-center border border-slate-200">
-            <div className="w-16 h-16 bg-emerald-100 text-emerald-600 rounded-full flex items-center justify-center mx-auto mb-4">
-              <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
-              </svg>
-            </div>
-            <h2 className="text-xl font-bold text-slate-800 mb-2">User Registered</h2>
-            <p className="text-sm font-bold text-slate-600 mb-6">
-              {name} has been added as a {role}. An invitation email has been sent to their inbox.
-            </p>
-            <button 
-              onClick={handleFinish}
-              className="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg transition-colors shadow-sm"
-            >
-              Back to Directory
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

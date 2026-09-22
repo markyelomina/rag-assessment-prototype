@@ -1,24 +1,96 @@
 'use client';
 
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
+import { supabase } from '@/lib/supabaseClient';
+
+interface DashboardExam {
+  id: string;
+  title: string;
+  target: string;
+  items: number;
+  status: string;
+  dueDate: string;
+}
 
 export default function FacultyDashboardPage() {
   const router = useRouter();
+  const [facultyName, setFacultyName] = useState<string>('Instructor');
+  const [examsList, setExamsList] = useState<DashboardExam[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  
+  const [dashboardStats, setDashboardStats] = useState({
+    totalExams: 0,
+    activeExams: 0,
+    pendingReviews: 0,
+    overallCompletion: '92%' // Placeholder 
+  });
 
-  const dashboardStats = {
-    totalExams: 24,
-    activeExams: 5,
-    pendingReviews: 12,
-    overallCompletion: '92%'
-  };
+  useEffect(() => {
+    const fetchDashboardData = async () => {
+      // 1. Get the active authenticated session
+      const { data: { user }, error: authError } = await supabase.auth.getUser();
+      
+      if (authError || !user) {
+        setIsLoading(false);
+        return;
+      }
 
-  const exams = [
-    { id: 1, title: 'Midterm Coverage Quiz', target: 'PSY301', items: 30, status: 'Active', dueDate: '2026-07-20' },
-    { id: 2, title: 'Personality Theories Final', target: 'PSY302', items: 50, status: 'Pending', dueDate: '2026-08-10' },
-    { id: 3, title: 'Introductory Concepts Quiz', target: 'PSY301', items: 15, status: 'Inactive', dueDate: '2026-06-15' },
-    { id: 4, title: 'Organizational Behavior Check', target: 'PSY303', items: 25, status: 'Active', dueDate: '2026-07-18' },
-  ];
+      // 2. Fetch the specific profile from your Users table
+      const [profileResponse, examsResponse] = await Promise.all([
+        supabase
+          .from('Users')
+          .select('name')
+          .eq('user_id', user.id)
+          .single(),
+        supabase
+          .from('Exams')
+          .select('exam_id, exam_title, exam_subject, schedule_start, global_status, references')
+          //.eq('created_by', user.id)
+          .order('schedule_start', { ascending: false })
+      ]);
+
+      if (profileResponse.data?.name) {
+        setFacultyName(profileResponse.data.name.split(' ')[0]);
+      }
+
+      if (examsResponse.data) {
+        let activeCount = 0;
+        let pendingCount = 0;
+
+        const formattedExams = examsResponse.data.map((exam: any) => {
+          const dueDateObj = new Date(exam.schedule_start);
+          const totalItems = Array.isArray(exam.references) ? exam.references.length * 10 : 0;
+          const status = exam.global_status || 'Pending';
+
+          // Tally stats during the mapping process
+          if (status === 'Active') activeCount++;
+          if (status === 'Pending') pendingCount++;
+
+          return {
+            id: exam.exam_id,
+            title: exam.exam_title,
+            target: exam.exam_subject || 'Comprehensive',
+            items: totalItems,
+            status: status,
+            dueDate: dueDateObj.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })
+          };
+        });
+
+        setExamsList(formattedExams);
+        setDashboardStats({
+          totalExams: formattedExams.length,
+          activeExams: activeCount,
+          pendingReviews: pendingCount,
+          overallCompletion: '92%' // Hardcoded for now
+        });
+      }
+
+      setIsLoading(false);
+    };
+
+    fetchDashboardData();
+  }, []);
 
   const getStatusBadge = (status: string) => {
     if (status === 'Active') return <span className="px-2.5 py-1 bg-emerald-100 text-emerald-800 rounded text-[10px] font-bold uppercase tracking-wider">{status}</span>;
@@ -32,18 +104,26 @@ export default function FacultyDashboardPage() {
     return 'Edit Settings';
   };
 
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <p className="text-slate-500 font-bold">Loading dashboard...</p>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6">
         <div>
-          <h1 className="text-2xl font-bold text-slate-800">Welcome Back, Instructor</h1>
+          <h1 className="text-2xl font-bold text-slate-800">Welcome Back, {facultyName}</h1>
           <p className="text-sm text-slate-500 mt-1 font-bold">Here is a summary of your upcoming exams and pending validations for this week.</p>
         </div>
         <button 
           onClick={() => router.push('/faculty/exams/create')}
           className="px-6 py-2.5 bg-blue-600 text-white text-sm font-bold rounded-lg hover:bg-blue-700 transition-colors shadow-sm whitespace-nowrap"
         >
-          + Create New Exam
+          Create New Exam
         </button>
       </div>
 
@@ -106,23 +186,31 @@ export default function FacultyDashboardPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-sm text-slate-700">
-              {exams.map((exam) => (
-                <tr key={exam.id} className="hover:bg-slate-50 transition-colors">
-                  <td className="p-6 font-bold text-slate-800">{exam.title}</td>
-                  <td className="p-6 font-bold text-slate-500">{exam.target}</td>
-                  <td className="p-6 font-bold text-slate-700">{exam.items}</td>
-                  <td className="p-6">{getStatusBadge(exam.status)}</td>
-                  <td className="p-6 font-bold text-slate-600">{exam.dueDate}</td>
-                  <td className="p-6">
-                    <button 
-                      onClick={() => router.push('/faculty/exams')}
-                      className="text-xs font-bold text-blue-600 hover:underline"
-                    >
-                      {getActionLabel(exam.status)}
-                    </button>
+              {examsList.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="p-8 text-center text-slate-500 font-bold">
+                    You haven't created any exams yet.
                   </td>
                 </tr>
-              ))}
+              ) : (
+                examsList.map((exam) => (
+                  <tr key={exam.id} className="hover:bg-slate-50 transition-colors">
+                    <td className="p-6 font-bold text-slate-800">{exam.title}</td>
+                    <td className="p-6 font-bold text-slate-500">{exam.target}</td>
+                    <td className="p-6 font-bold text-slate-700">{exam.items}</td>
+                    <td className="p-6">{getStatusBadge(exam.status)}</td>
+                    <td className="p-6 font-bold text-slate-600">{exam.dueDate}</td>
+                    <td className="p-6">
+                      <button 
+                        onClick={() => router.push('/faculty/exams')}
+                        className="text-xs font-bold text-blue-600 hover:underline"
+                      >
+                        {getActionLabel(exam.status)}
+                      </button>
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>

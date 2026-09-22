@@ -1,13 +1,13 @@
 'use client';
 
 import React, { useState } from 'react';
+import EmptyState from '@/components/ui/EmptyState';
+import { usePagination } from '@/hooks/usePagination';
 
 export default function AdminCohortsPage() {
   const [selectedCohort, setSelectedCohort] = useState<number | null>(null);
   const [studentSearch, setStudentSearch] = useState('');
   const [cohortTab, setCohortTab] = useState('active');
-  const [currentPage, setCurrentPage] = useState(1);
-  const studentsPerPage = 5;
 
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newCohortName, setNewCohortName] = useState('');
@@ -82,10 +82,17 @@ export default function AdminCohortsPage() {
     student.email.toLowerCase().includes(studentSearch.toLowerCase())
   ) || [];
 
-  const indexOfLastStudent = currentPage * studentsPerPage;
-  const indexOfFirstStudent = indexOfLastStudent - studentsPerPage;
-  const currentStudents = filteredStudents.slice(indexOfFirstStudent, indexOfLastStudent);
-  const totalPages = Math.ceil(filteredStudents.length / studentsPerPage);
+  const {
+    currentPage,
+    totalPages,
+    currentItems: currentStudents,
+    indexOfFirstItem: indexOfFirstStudent,
+    indexOfLastItem: indexOfLastStudent,
+    totalItems,
+    nextPage,
+    prevPage,
+    resetPage
+  } = usePagination(filteredStudents, 5);
 
   const displayedCohorts = cohorts.filter(c => 
     cohortTab === 'active' ? c.status === 'Active' : c.status === 'Archived'
@@ -96,7 +103,7 @@ export default function AdminCohortsPage() {
       <div className="space-y-6">
         <div className="flex items-center gap-3 mb-2">
           <button 
-            onClick={() => { setSelectedCohort(null); setCurrentPage(1); setStudentSearch(''); }} 
+            onClick={() => { setSelectedCohort(null); setStudentSearch(''); }} 
             className="text-slate-500 hover:text-blue-600 font-bold text-sm flex items-center gap-1"
           >
             &larr; Back to Cohorts
@@ -140,7 +147,10 @@ export default function AdminCohortsPage() {
             </div>
             <div className="p-2">
               {currentCohort.teachers.length === 0 ? (
-                <div className="p-6 text-center text-sm font-bold text-slate-500">No teachers assigned yet.</div>
+                <EmptyState 
+                  title="No Teachers Assigned" 
+                  message="There are currently no teachers assigned to this cohort workspace." 
+                />
               ) : (
                 <ul className="divide-y divide-slate-100">
                   {currentCohort.teachers.map(teacher => (
@@ -184,7 +194,7 @@ export default function AdminCohortsPage() {
                     type="text" 
                     placeholder="Search enrolled students..." 
                     value={studentSearch}
-                    onChange={(e) => { setStudentSearch(e.target.value); setCurrentPage(1); }}
+                    onChange={(e) => { setStudentSearch(e.target.value); resetPage(); }}
                     className="w-full text-xs font-bold px-3 py-2 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 outline-none" 
                   />
                 </div>
@@ -197,7 +207,10 @@ export default function AdminCohortsPage() {
             
             <div className="flex-1 p-2">
               {currentStudents.length === 0 ? (
-                <div className="p-6 text-center text-sm font-bold text-slate-500">No students found matching your search.</div>
+                <EmptyState 
+                  title="No Students Found" 
+                  message="No enrolled students match your current search query." 
+                />
               ) : (
                 <ul className="flex flex-col">
                   {currentStudents.map(student => (
@@ -217,17 +230,17 @@ export default function AdminCohortsPage() {
             </div>
 
             <div className="p-3 border-t border-slate-100 bg-slate-50 flex justify-between items-center text-xs font-bold text-slate-500">
-              <span>Showing {filteredStudents.length > 0 ? indexOfFirstStudent + 1 : 0} to {Math.min(indexOfLastStudent, filteredStudents.length)} of {filteredStudents.length} students</span>
+              <span>Showing {filteredStudents.length > 0 ? indexOfFirstStudent + 1 : 0} to {Math.min(indexOfLastStudent, filteredStudents.length)} of {totalItems} students</span>
               <div className="flex gap-1.5">
                 <button 
-                  onClick={() => setCurrentPage(prev => Math.max(prev - 1, 1))}
+                  onClick={prevPage}
                   disabled={currentPage === 1}
                   className={`px-3 py-1.5 border rounded font-bold shadow-sm ${currentPage === 1 ? 'border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed' : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'}`}
                 >
                   Prev
                 </button>
                 <button 
-                  onClick={() => setCurrentPage(prev => Math.min(prev + 1, totalPages))}
+                  onClick={nextPage}
                   disabled={currentPage === totalPages || totalPages === 0}
                   className={`px-3 py-1.5 border rounded font-bold shadow-sm ${currentPage === totalPages || totalPages === 0 ? 'border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed' : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'}`}
                 >

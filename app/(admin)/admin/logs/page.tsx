@@ -1,6 +1,8 @@
 'use client';
 
 import React, { useState } from 'react';
+import EmptyState from '@/components/ui/EmptyState';
+import { usePagination } from '@/hooks/usePagination';
 
 export default function AdminLogsPage() {
   const [logSearch, setLogSearch] = useState('');
@@ -10,9 +12,6 @@ export default function AdminLogsPage() {
   const [customStartDate, setCustomStartDate] = useState('');
   const [customEndDate, setCustomEndDate] = useState('');
   
-  const [currentPage, setCurrentPage] = useState(1);
-  const logsPerPage = 6;
-
   const [selectedLog, setSelectedLog] = useState<any>(null);
 
   const auditLogs = [
@@ -32,14 +31,21 @@ export default function AdminLogsPage() {
     return matchesSearch && matchesType;
   });
 
-  const indexOfLastLog = currentPage * logsPerPage;
-  const indexOfFirstLog = indexOfLastLog - logsPerPage;
-  const currentLogs = filteredLogs.slice(indexOfFirstLog, indexOfLastLog);
-  const totalPages = Math.ceil(filteredLogs.length / logsPerPage);
+  const {
+    currentPage,
+    totalPages,
+    currentItems: currentLogs,
+    indexOfFirstItem: indexOfFirstLog,
+    indexOfLastItem: indexOfLastLog,
+    totalItems,
+    nextPage,
+    prevPage,
+    resetPage
+  } = usePagination(filteredLogs, 6);
 
   const handleDateFilterChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     setLogDateFilter(e.target.value);
-    setCurrentPage(1);
+    resetPage();
   };
 
   return (
@@ -67,7 +73,7 @@ export default function AdminLogsPage() {
                 type="text" 
                 placeholder="Search by User Email or Event ID..." 
                 value={logSearch}
-                onChange={(e) => { setLogSearch(e.target.value); setCurrentPage(1); }}
+                onChange={(e) => { setLogSearch(e.target.value); resetPage(); }}
                 className="w-full text-xs font-bold px-3 py-2.5 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 outline-none" 
               />
             </div>
@@ -106,7 +112,7 @@ export default function AdminLogsPage() {
 
             <select 
               value={logTypeFilter}
-              onChange={(e) => { setLogTypeFilter(e.target.value); setCurrentPage(1); }}
+              onChange={(e) => { setLogTypeFilter(e.target.value); resetPage(); }}
               className="text-xs font-bold px-3 py-2.5 border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 outline-none bg-white text-slate-700"
             >
               <option value="All Events">All Event Types</option>
@@ -133,7 +139,12 @@ export default function AdminLogsPage() {
             <tbody className="divide-y divide-slate-100 text-xs md:text-sm text-slate-700">
               {currentLogs.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="p-8 text-center font-bold text-slate-500">No logs found matching your filters.</td>
+                  <td colSpan={6}>
+                    <EmptyState 
+                      title="No logs found" 
+                      message="No audit logs match your current search and filter criteria. Try adjusting your date range or event type." 
+                    />
+                  </td>
                 </tr>
               ) : (
                 currentLogs.map((log) => (
@@ -174,17 +185,17 @@ export default function AdminLogsPage() {
         </div>
 
         <div className="bg-slate-50 p-4 border-t border-slate-200 flex justify-between items-center text-sm font-bold text-slate-500">
-          <span>Showing {filteredLogs.length > 0 ? indexOfFirstLog + 1 : 0} to {Math.min(indexOfLastLog, filteredLogs.length)} of {filteredLogs.length} events</span>
+          <span>Showing {filteredLogs.length > 0 ? indexOfFirstLog + 1 : 0} to {Math.min(indexOfLastLog, filteredLogs.length)} of {totalItems} events</span>
           <div className="flex gap-2">
             <button 
-              onClick={() => setCurrentPage(prev => Math.max(prev - 1, 1))}
+              onClick={prevPage}
               disabled={currentPage === 1}
               className={`px-3 py-1.5 border rounded font-bold shadow-sm ${currentPage === 1 ? 'border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed' : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'}`}
             >
               Previous
             </button>
             <button 
-              onClick={() => setCurrentPage(prev => Math.min(prev + 1, totalPages))}
+              onClick={nextPage}
               disabled={currentPage === totalPages || totalPages === 0}
               className={`px-3 py-1.5 border rounded font-bold shadow-sm ${currentPage === totalPages || totalPages === 0 ? 'border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed' : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-50'}`}
             >
