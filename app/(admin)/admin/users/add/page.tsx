@@ -1,8 +1,15 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { useToast } from '@/components/ui/ToastContext';
+import { supabase } from '@/lib/supabaseClient';
+import { createClient } from '@supabase/supabase-js';
+
+interface DropdownCohort {
+  id: string;
+  name: string;
+}
 
 export default function AddUserPage() {
   const router = useRouter();
@@ -16,6 +23,32 @@ export default function AddUserPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
 
+  const [availableCohorts, setAvailableCohorts] = useState<DropdownCohort[]>([]);
+  const [isFetchingCohorts, setIsFetchingCohorts] = useState(true);
+
+  useEffect(() => {
+    const fetchCohorts = async () => {
+      const { data, error } = await supabase
+        .from('Cohorts')
+        .select('cohort_id, cohort_name')
+        .eq('account_status', 'Active') // Only show active cohorts in the dropdown
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error("Error fetching cohorts for dropdown:", error.message);
+      } else if (data) {
+        const formattedCohorts = data.map((c: any) => ({
+          id: c.cohort_id,
+          name: c.cohort_name
+        }));
+        setAvailableCohorts(formattedCohorts);
+      }
+      setIsFetchingCohorts(false);
+    };
+
+    fetchCohorts();
+  }, []);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
@@ -26,12 +59,61 @@ export default function AddUserPage() {
         throw new Error('Please select a cohort for the learner.');
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      const roleMap: Record<string, number> = {
+        'Learner / Reviewer': 1,
+        'Teacher / Faculty': 2,
+        'Admin': 3
+      };
+      const roleId = roleMap[role];
+
+      const tempAdminClient = createClient(
+        process.env.NEXT_PUBLIC_SUPABASE_URL!,
+        process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!,
+        { auth: { persistSession: false } }
+      );
+
+      const { data: authData, error: authError } = await tempAdminClient.auth.signUp({
+        email: email,
+        password: 'malayan@2026'  // Default password for new users, 
+      });
+
+      if (authError) throw authError;
+
+      if (authData.user) {
+        const { error: dbError } = await supabase
+          .from('Users')
+          .insert([
+            {
+              user_id: authData.user.id,
+              name: name,
+              email: email, 
+              role_id: roleId,
+              cohort_id: role === 'Learner / Reviewer' ? cohort : null, 
+              account_status: 'Active'
+            }
+          ]);
+
+        if (dbError) throw dbError;
+
+        const { data: sessionData } = await supabase.auth.getUser();
+        const activeAdminEmail = sessionData?.user?.email || 'Unknown Admin';
+
+        await supabase.from('AuditLogs').insert([{
+          user_email: activeAdminEmail,
+          role: 'Admin',
+          action: `Created new user account: ${email} as ${role}`,
+          type: 'Security',
+          severity: 'Warning', 
+          ip_address: 'Internal',
+          user_agent: navigator.userAgent
+        }]);
+      }
       
       addToast(`${name} was successfully registered as a ${role}.`, 'success');
       router.push('/admin/users');
 
     } catch (error: any) {
+      console.error("User Creation Error:", error);
       setErrorMessage(error.message || 'An unexpected error occurred. Please try again.');
       setIsLoading(false);
     }
@@ -111,14 +193,19 @@ export default function AddUserPage() {
             <select 
               value={cohort}
               onChange={(e) => setCohort(e.target.value)}
-              disabled={isLoading}
+              disabled={isLoading || isFetchingCohorts}
               className={`w-full px-4 py-3 border rounded-lg text-sm font-bold focus:outline-none focus:ring-1 bg-white text-slate-700 disabled:bg-slate-50 disabled:text-slate-500 ${
                 errorMessage && !cohort ? 'border-red-300 focus:border-red-500 focus:ring-red-500' : 'border-slate-300 focus:border-blue-500 focus:ring-blue-500'
               }`}
             >
-              <option value="" disabled>Select a cohort...</option>
-              <option value="Cohort Alpha 2026">Cohort Alpha 2026</option>
-              <option value="Cohort Beta 2026">Cohort Beta 2026</option>
+              <option value="" disabled>
+                {isFetchingCohorts ? 'Loading cohorts...' : 'Select a cohort...'}
+              </option>
+              {availableCohorts.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
             </select>
             <p className="text-xs font-bold text-slate-500 mt-2">Learners must be assigned to a cohort to access specific exams.</p>
           </div>

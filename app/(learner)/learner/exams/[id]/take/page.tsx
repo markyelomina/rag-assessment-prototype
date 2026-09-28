@@ -3,13 +3,22 @@
 import React, { useState, useEffect } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
+import { useToast } from '@/components/ui/ToastContext';
+
+interface Question {
+  id: string;
+  text: string;
+  options: string[];
+  correctAnswer: string;
+}
 
 export default function LearnerActiveExamPage() {
   const router = useRouter();
   const params = useParams();
+  const { addToast } = useToast();
   
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
-  const [answers, setAnswers] = useState<Record<number, string>>({});
+  const [answers, setAnswers] = useState<Record<string, string>>({});
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showSubmitModal, setShowSubmitModal] = useState(false);
   const [showTimeUpModal, setShowTimeUpModal] = useState(false);
@@ -17,44 +26,134 @@ export default function LearnerActiveExamPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [examTitle, setExamTitle] = useState('Loading Exam...');
   const [timeLeft, setTimeLeft] = useState(0);
+  const [questions, setQuestions] = useState<Question[]>([]);
+  
+  // New state to hold the start time for the database
+  const [examStartTime, setExamStartTime] = useState<string>('');
 
-  const mockQuestions = [
-    { id: 1, text: 'Which of the following is considered a negative symptom of schizophrenia?', options: ['Delusions', 'Hallucinations', 'Avolition', 'Disorganized speech'] },
-    { id: 2, text: 'What is the primary difference between Bipolar I and Bipolar II?', options: ['Presence of major depressive episodes', 'Presence of a full manic episode', 'Age of onset', 'Response to lithium'] },
-    { id: 3, text: 'Which brain structure is most heavily implicated in the consolidation of new explicit memories?', options: ['Amygdala', 'Hippocampus', 'Basal Ganglia', 'Cerebellum'] },
-    { id: 4, text: 'Which therapeutic approach emphasizes unconditional positive regard?', options: ['Cognitive Behavioral Therapy', 'Psychoanalysis', 'Person-Centered Therapy', 'Gestalt Therapy'] },
-    { id: 5, text: 'In experimental research, the variable that is manipulated by the researcher is known as the:', options: ['Dependent variable', 'Confounding variable', 'Control variable', 'Independent variable'] },
-  ];
-
+  // 1. Fetch Exam Details, Validate Access, and Initialize Timers
   useEffect(() => {
-    const fetchExamDetails = async () => {
+    const fetchExamAndQuestions = async () => {
       const examId = params?.id as string; 
       if (!examId) return;
 
-      const { data: exam, error } = await supabase
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) {
+        addToast("Authentication required.", "error");
+        router.push('/login');
+        return;
+      }
+
+      // Step A: Fetch Exam Configurations
+      const { data: exam, error: examError } = await supabase
         .from('Exams')
-        .select('exam_title, time_limit_mins')
+        .select('exam_title, time_limit_mins, global_status, schedule_end, close_after_deadline, max_attempts')
         .eq('exam_id', examId)
         .single();
 
-      if (error || !exam) {
+      if (examError || !exam) {
         console.error("Failed to load exam details");
         setExamTitle('Error Loading Exam');
+        setIsLoading(false);
+        return;
+      }
+
+      // Strict Access Control 1: Is the exam active?
+      if (exam.global_status !== 'Active') {
+        addToast("This exam is currently unavailable.", "error");
+        router.push('/learner/exams');
+        return;
+      }
+
+      // Strict Access Control 2: Has the deadline passed?
+      if (exam.close_after_deadline && exam.schedule_end) {
+        const deadline = new Date(exam.schedule_end).getTime();
+        if (Date.now() > deadline) {
+          addToast("The deadline for this exam has passed.", "error");
+          router.push('/learner/exams');
+          return;
+        }
+      }
+
+      // Strict Access Control 3: Has the student exceeded max attempts?
+      const { count: attemptCount, error: countError } = await supabase
+        .from('Student Attempts')
+        .select('attempt_id', { count: 'exact', head: true })
+        .eq('exam_id', examId)
+        .eq('student_id', user.id);
+
+      if (!countError && attemptCount !== null && attemptCount >= (exam.max_attempts || 1)) {
+        addToast(`You have reached the maximum allowed attempts (${exam.max_attempts}) for this exam.`, "error");
+        router.push('/learner/performance');
         return;
       }
 
       setExamTitle(exam.exam_title);
+
+      // Step B: Load Questions
+      const { data: dbQuestions, error: qError } = await supabase
+        .from('Mock Exam Items')
+        .select('id, question, options, correct_answer')
+        .eq('exam_session_id', examId);
+
+      if (qError || !dbQuestions || dbQuestions.length === 0) {
+        console.error("Failed to load exam questions");
+        setIsLoading(false);
+        return;
+      }
+
+      const formattedQuestions: Question[] = dbQuestions.map((q: any) => {
+        let parsedOptions: string[] = [];
+        try {
+          let raw = q.options;
+          while (typeof raw === 'string') {
+            raw = JSON.parse(raw);
+          }
+          if (Array.isArray(raw)) {
+            parsedOptions = raw.map(opt => String(opt));
+          } else if (typeof raw === 'object' && raw !== null) {
+            parsedOptions = Object.values(raw).map(opt => String(opt));
+          } else {
+            console.warn(`Unrecognized options format for Question ${q.id}:`, q.options);
+          }
+        } catch (e) {
+          console.error(`Failed to parse options for Question ${q.id}. Raw data:`, q.options);
+        }
+
+        if (parsedOptions.length === 0) {
+           parsedOptions = ["Error: Option A missing", "Error: Option B missing"]; 
+        }
+
+        return {
+          id: q.id,
+          text: q.question,
+          options: parsedOptions,
+          correctAnswer: String(q.correct_answer),
+        };
+      });
+
+      setQuestions(formattedQuestions);
       
-      const storageKey = `exam_endtime_${examId}`;
-      const storedEndTime = sessionStorage.getItem(storageKey);
+      // Step C: Timer setup & Start Time Capture
+      const endTimeKey = `exam_endtime_${examId}`;
+      const startTimeKey = `exam_starttime_${examId}`;
       
+      let storedEndTime = sessionStorage.getItem(endTimeKey);
+      let storedStartTime = sessionStorage.getItem(startTimeKey);
+      
+      if (!storedStartTime) {
+        storedStartTime = new Date().toISOString();
+        sessionStorage.setItem(startTimeKey, storedStartTime);
+      }
+      setExamStartTime(storedStartTime);
+
       let endTime: number;
       if (storedEndTime) {
         endTime = parseInt(storedEndTime, 10);
       } else {
         const durationMs = (exam.time_limit_mins || 60) * 60 * 1000;
         endTime = Date.now() + durationMs;
-        sessionStorage.setItem(storageKey, endTime.toString());
+        sessionStorage.setItem(endTimeKey, endTime.toString());
       }
 
       const calculatedTimeLeft = Math.max(0, Math.floor((endTime - Date.now()) / 1000));
@@ -62,9 +161,10 @@ export default function LearnerActiveExamPage() {
       setIsLoading(false);
     };
 
-    fetchExamDetails();
-  }, [params]);
+    fetchExamAndQuestions();
+  }, [params, router, addToast]);
 
+  // 2. Countdown Timer Interval
   useEffect(() => {
     if (isLoading || isSubmitting || showTimeUpModal) return;
 
@@ -81,7 +181,7 @@ export default function LearnerActiveExamPage() {
         if (newTimeLeft <= 0) {
           clearInterval(timerInterval);
           setTimeLeft(0);
-          setShowTimeUpModal(true);
+          setShowTimeUpModal(true); 
           setShowSubmitModal(false);
         } else {
           setTimeLeft(newTimeLeft);
@@ -92,6 +192,7 @@ export default function LearnerActiveExamPage() {
     return () => clearInterval(timerInterval);
   }, [isLoading, isSubmitting, showTimeUpModal, params]);
 
+  // 3. Auto-submit grace period timer after time is up popup shows
   useEffect(() => {
     if (showTimeUpModal && !isSubmitting) {
       const autoSubmitTimer = setTimeout(() => {
@@ -116,12 +217,12 @@ export default function LearnerActiveExamPage() {
   const handleOptionSelect = (option: string) => {
     setAnswers({
       ...answers,
-      [mockQuestions[currentQuestionIndex].id]: option
+      [questions[currentQuestionIndex].id]: option
     });
   };
 
   const handleNext = () => {
-    if (currentQuestionIndex < mockQuestions.length - 1) {
+    if (currentQuestionIndex < questions.length - 1) {
       setCurrentQuestionIndex(prev => prev + 1);
     }
   };
@@ -132,30 +233,112 @@ export default function LearnerActiveExamPage() {
     }
   };
 
+  // 4. Final Submission Logic
   const handleFinalSubmit = async () => {
+    if (isSubmitting) return;
     setIsSubmitting(true);
     setShowSubmitModal(false);
     setShowTimeUpModal(false);
 
     const examId = params?.id as string;
+    
+    // Clean up session storage
     sessionStorage.removeItem(`exam_endtime_${examId}`);
+    sessionStorage.removeItem(`exam_starttime_${examId}`);
 
     try {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error("No authenticated user found.");
+
+      let correctCount = 0;
+      questions.forEach((q) => {
+        const studentChoice = answers[q.id];
+        if (studentChoice && studentChoice === q.correctAnswer) {
+          correctCount++;
+        }
+      });
+
+      const finalPercentageScore = Math.round((correctCount / questions.length) * 100);
+
+      // Pass both started_at and completed_at to satisfy Postgres constraints
+      const { data: attemptData, error: attemptError } = await supabase
+        .from('Student Attempts')
+        .insert({
+          exam_id: examId,
+          student_id: user.id,
+          exam_status: 'completed',
+          final_score: finalPercentageScore,
+          started_at: examStartTime || new Date().toISOString(),
+          completed_at: new Date().toISOString()
+        })
+        .select('attempt_id')
+        .single();
+
+      if (attemptError || !attemptData) {
+        throw new Error(`Failed to record attempt: ${attemptError?.message}`);
+      }
+
+      const attemptId = attemptData.attempt_id;
+
+      // Map answers exactly to the schema (REMOVED student_id)
+      const answerPayloads = questions.map((q) => ({
+        attempt_id: attemptId,
+        question_id: q.id,
+        selected_option: answers[q.id] || null,
+        is_correct: answers[q.id] === q.correctAnswer,
+      }));
+
+      const { error: answersError } = await supabase
+        .from('Student Answers')
+        .insert(answerPayloads);
+        
+      if (answersError) {
+        console.error("Failed to save individual answers:", answersError.message);
+      }
+
+      addToast("Exam submitted successfully!", "success");
       router.push('/learner/performance');
     } catch (error) {
-      console.error('Failed to submit exam');
-      setIsSubmitting(false);
+      console.error('Failed to submit exam:', error);
+      addToast("Failed to submit exam. Please try again.", "error");
+      setIsSubmitting(false); // Unlock button if an error occurs so they can try again
     }
   };
 
-  const currentQuestion = mockQuestions[currentQuestionIndex];
-  const isLastQuestion = currentQuestionIndex === mockQuestions.length - 1;
-  const progressPercentage = ((currentQuestionIndex + 1) / mockQuestions.length) * 100;
+  if (isLoading) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-slate-50">
+        <svg className="animate-spin h-10 w-10 text-blue-600 mb-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+        <p className="text-slate-700 font-bold">Loading assessment environment...</p>
+      </div>
+    );
+  }
+
+  if (questions.length === 0) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-slate-50 p-6">
+        <div className="bg-white p-8 rounded-xl shadow-sm border border-slate-200 text-center max-w-md w-full">
+          <h2 className="text-xl font-bold text-slate-800 mb-2">No Questions Found</h2>
+          <p className="text-sm text-slate-500 font-bold mb-6">This exam does not have any generated questions available yet.</p>
+          <button onClick={() => router.push('/learner/exams')} className="px-6 py-2.5 bg-blue-600 text-white font-bold text-sm rounded-lg hover:bg-blue-700 transition-colors">
+            Return to Exams
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const currentQuestion = questions[currentQuestionIndex];
+  const isLastQuestion = currentQuestionIndex === questions.length - 1;
+  const progressPercentage = ((currentQuestionIndex + 1) / questions.length) * 100;
   const isTimeLow = timeLeft > 0 && timeLeft < 300; 
+  const safeOptions = Array.isArray(currentQuestion?.options) ? currentQuestion.options : [];
 
   return (
-    <div className="min-h-screen flex flex-col">
+    <div className="min-h-screen flex flex-col bg-slate-50">
       
       <header className="bg-white border-b border-slate-200 p-4 sticky top-0 z-30 shadow-sm flex justify-between items-center">
         <div>
@@ -181,7 +364,7 @@ export default function LearnerActiveExamPage() {
           <div className="mb-8">
             <div className="flex justify-between items-center mb-2">
               <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">
-                Question {currentQuestionIndex + 1} of {mockQuestions.length}
+                Question {currentQuestionIndex + 1} of {questions.length}
               </span>
               <span className="text-xs font-bold text-blue-600">
                 {Object.keys(answers).length} Answered
@@ -201,7 +384,7 @@ export default function LearnerActiveExamPage() {
             </h2>
 
             <div className="space-y-4 flex-1">
-              {currentQuestion.options.map((option, idx) => {
+              {safeOptions.map((option, idx) => {
                 const isSelected = answers[currentQuestion.id] === option;
                 return (
                   <label 
@@ -261,7 +444,7 @@ export default function LearnerActiveExamPage() {
             </h3>
             
             <div className="grid grid-cols-5 gap-2 mb-6">
-              {mockQuestions.map((q, idx) => {
+              {questions.map((q, idx) => {
                 const isAnswered = !!answers[q.id];
                 const isCurrent = currentQuestionIndex === idx;
                 
@@ -311,7 +494,7 @@ export default function LearnerActiveExamPage() {
           <div className="bg-white rounded-xl shadow-2xl max-w-sm w-full p-6 border border-slate-200">
             <h3 className="text-xl font-bold text-slate-800 mb-2">Submit Exam</h3>
             <p className="text-sm text-slate-600 font-bold mb-6">
-              Are you sure you are ready to submit? You have answered {Object.keys(answers).length} out of {mockQuestions.length} questions. You cannot change your answers after submission.
+              Are you sure you are ready to submit? You have answered {Object.keys(answers).length} out of {questions.length} questions. You cannot change your answers after submission.
             </p>
             <div className="flex justify-end gap-3">
               <button 
@@ -342,7 +525,7 @@ export default function LearnerActiveExamPage() {
             </div>
             <h3 className="text-xl font-bold text-slate-800 mb-2">Time is Up!</h3>
             <p className="text-sm text-slate-600 font-bold mb-6">
-              The allotted time for this exam has expired. Your current answers are being automatically submitted.
+              The allotted time for this exam has expired. Your answers are being automatically submitted.
             </p>
             <button 
               onClick={handleFinalSubmit}
@@ -361,7 +544,7 @@ export default function LearnerActiveExamPage() {
              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
            </svg>
-           <p className="text-slate-800 font-bold text-lg">Saving your answers</p>
+           <p className="text-slate-800 font-bold text-lg">Evaluating and saving your answers...</p>
            <p className="text-slate-500 font-bold text-sm mt-1">Please do not close the browser</p>
         </div>
       )}

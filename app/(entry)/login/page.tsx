@@ -37,64 +37,116 @@ export default function LoginPage() {
     setIsLoading(true);
 
     const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
-      email: email,
-      password: password,
+      email,
+      password,
     });
 
     if (authError) {
-      setErrors({ email: 'Invalid login credentials. Please try again.' });
+      await supabase.from('AuditLogs').insert([{
+        user_email: email,
+        role: 'Unauthenticated',
+        action: 'Failed login attempt (Invalid credentials)',
+        type: 'Security',
+        severity: 'Warning',
+        ip_address: 'Client IP', 
+        user_agent: navigator.userAgent
+      }]);
+      setErrors({ email: 'Invalid email or password.' });
       setIsLoading(false);
       return;
     }
 
-    const { data: profileData, error: profileError } = await supabase
-      .from('Users')
-      .select('role_id')
-      .eq('user_id', authData.user.id)
-      .single();
+    if (authData.user) {
+      const { data: userData, error: userError } = await supabase
+        .from('Users')
+        .select('account_status')
+        .eq('user_id', authData.user.id)
+        .single();
 
-    if (profileError || !profileData) {
-      setErrors({ email: 'Could not retrieve user profile.' });
-      setIsLoading(false);
-      return;
-    }
+      if (userError || !userData) {
+        setErrors({ email: "Could not verify account status." });
+        setIsLoading(false);
+        return;
+      }
 
-    if (profileData.role_id === 3) {
-      window.location.href = '/admin';
-    } else if (profileData.role_id === 2) {
-      window.location.href = '/faculty';
-    } else if (profileData.role_id === 1) {
-      window.location.href = '/learner';
+      if (userData.account_status !== 'Active') {
+        await supabase.auth.signOut();
+        setErrors({ email: "Your account has been deactivated. Please contact an administrator." });
+        setIsLoading(false);
+        return;
+      }
+
+      await supabase
+        .from('Users')
+        .update({ last_login: new Date().toISOString() })
+        .eq('user_id', authData.user.id);
+
+      const { data: profileData, error: profileError } = await supabase
+        .from('Users')
+        .select('role_id')
+        .eq('user_id', authData.user.id)
+        .single();
+
+      if (profileError || !profileData) {
+        setErrors({ email: "Could not retrieve user profile." });
+        setIsLoading(false);
+        return;
+      }
+
+      const roleMap: Record<number, string> = { 1: 'Learner', 2: 'Teacher', 3: 'Admin' };
+      const userRoleString = roleMap[profileData.role_id] || 'Unknown';
+
+      await supabase.from('AuditLogs').insert([{
+        user_email: email, 
+        role: userRoleString, 
+        action: 'Successful user login',
+        type: 'User Activity',
+        severity: 'Info',
+        ip_address: 'Client IP',
+        user_agent: navigator.userAgent
+      }]);
+
+      if (profileData.role_id === 3) {
+        window.location.href = '/admin';
+      } else if (profileData.role_id === 2) {
+        window.location.href = '/faculty';
+      } else if (profileData.role_id === 1) {
+        window.location.href = '/learner';
+      }
     }
   };
 
   return (
-    <div className="max-w-md w-full bg-white rounded-xl shadow-md border border-slate-200 overflow-hidden">
+    <div className="max-w-md w-full bg-white rounded-2xl shadow-2xl border border-slate-100 overflow-hidden">
       
-      <div className="p-6 bg-slate-900 text-center">
-        <h1 className="text-2xl font-bold text-blue-400">RPLE Platform</h1>
-        <p className="text-sm text-slate-300 mt-1">Sign in to your account</p>
+      <div className="pt-10 pb-4 px-8 text-center flex flex-col items-center">
+        <img 
+          src="/logo.png" 
+          alt="DeepCore Prep Logo" 
+          className="h-40 w-auto object-contain mix-blend-multiply brightness-110 contrast-125" 
+        />
+        <p className="text-sm font-bold text-slate-500 mt-2">Sign in to your account</p>
       </div>
 
-      <div className="p-6">
-        <form onSubmit={handleSubmit} className="space-y-4">
+      <div className="px-8 pb-10">
+        <form onSubmit={handleSubmit} className="space-y-5">
           <div>
-            <label className="block text-sm font-bold text-slate-700 mb-1">Email Address</label>
+            <label className="block text-sm font-bold text-slate-700 mb-1.5">Email Address</label>
             <input 
               type="email" 
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               placeholder="name@university.edu" 
               disabled={isLoading}
-              className={`w-full px-4 py-3 bg-white border-2 text-slate-900 rounded-lg focus:outline-none focus:ring-1 placeholder-slate-400 ${
-                errors.email ? 'border-red-500 focus:border-red-500 focus:ring-red-500' : 'border-slate-300 focus:border-blue-600 focus:ring-blue-600'
+              className={`w-full px-4 py-3 bg-slate-50 border-2 text-slate-900 rounded-xl focus:outline-none focus:ring-0 placeholder-slate-400 transition-colors ${
+                errors.email ? 'border-red-500 bg-red-50' : 'border-slate-200 focus:border-blue-600 focus:bg-white'
               } ${isLoading ? 'opacity-50 cursor-not-allowed' : ''}`}
             />
-            {errors.email && <p className="text-xs text-red-600 mt-1 font-bold">{errors.email}</p>}
+            {errors.email && <p className="text-xs text-red-600 mt-1.5 font-bold">{errors.email}</p>}
           </div>
           
           <div>
-            <label className="block text-sm font-bold text-slate-700 mb-1">Password</label>
+            <label className="block text-sm font-bold text-slate-700 mb-1.5">Password</label>
             <div className="relative">
               <input 
                 type={showPassword ? 'text' : 'password'} 
@@ -102,34 +154,34 @@ export default function LoginPage() {
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="Enter your password" 
                 disabled={isLoading}
-                className={`w-full px-4 py-3 bg-white border-2 text-slate-900 rounded-lg focus:outline-none focus:ring-1 pr-12 placeholder-slate-400 ${
-                  errors.password ? 'border-red-500 focus:border-red-500 focus:ring-red-500' : 'border-slate-300 focus:border-blue-600 focus:ring-blue-600'
+                className={`w-full px-4 py-3 bg-slate-50 border-2 text-slate-900 rounded-xl focus:outline-none focus:ring-0 pr-12 placeholder-slate-400 transition-colors ${
+                  errors.password ? 'border-red-500 bg-red-50' : 'border-slate-200 focus:border-blue-600 focus:bg-white'
                 } ${isLoading ? 'opacity-50 cursor-not-allowed' : ''}`}
               />
               <button
                 type="button"
                 onClick={() => setShowPassword(!showPassword)}
                 disabled={isLoading}
-                className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-700 focus:outline-none text-sm font-bold"
+                className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-500 hover:text-blue-600 focus:outline-none text-sm font-bold transition-colors"
               >
                 {showPassword ? 'Hide' : 'Show'}
               </button>
             </div>
 
-            <div className="mt-2 flex justify-end">
-              <Link href="/forgot_password" className="text-xs font-bold text-blue-600 hover:underline">
+            <div className="mt-3 flex justify-end">
+              <Link href="/forgot_password" className="text-xs font-bold text-blue-600 hover:text-blue-700 transition-colors">
                 Forgot Password?
               </Link>
             </div>
             
-            {errors.password && <p className="text-xs text-red-600 mt-1 font-bold">{errors.password}</p>}
+            {errors.password && <p className="text-xs text-red-600 mt-1.5 font-bold">{errors.password}</p>}
           </div>
           
           <button 
             type="submit" 
             disabled={isLoading}
-            className={`w-full text-white font-bold py-3 px-4 rounded-lg transition-colors mt-2 flex justify-center items-center ${
-              isLoading ? 'bg-blue-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'
+            className={`w-full text-white font-bold py-3.5 px-4 rounded-xl transition-all mt-4 flex justify-center items-center shadow-md ${
+              isLoading ? 'bg-blue-400 cursor-not-allowed shadow-none' : 'bg-blue-600 hover:bg-blue-700 hover:shadow-lg active:scale-[0.98]'
             }`}
           >
             {isLoading ? (
@@ -146,7 +198,7 @@ export default function LoginPage() {
           </button>
         </form>
 
-        <div className="mt-6 text-center">
+        <div className="mt-8 pt-6 border-t border-slate-100 text-center">
           <p className="text-xs font-bold text-slate-500">
             Need an account? Please contact your university administrator.
           </p>

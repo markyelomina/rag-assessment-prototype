@@ -2,58 +2,158 @@
 
 import React, { useState, useEffect } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } from 'recharts';
+import { supabase } from '@/lib/supabaseClient';
 
 export default function FacultyAnalyticsPage() {
   const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingRoster, setIsLoadingRoster] = useState(false);
+  
   const [cohortData, setCohortData] = useState<any[]>([]);
   const [itemAnalysis, setItemAnalysis] = useState<any[]>([]);
-  const [mockStudents, setMockStudents] = useState<any[]>([]);
+  const [cohortStudents, setCohortStudents] = useState<any[]>([]);
 
   const [sortKey, setSortKey] = useState<'cohort' | 'averageScoreNum' | 'completionRateNum'>('averageScoreNum');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
-  const [expandedCohort, setExpandedCohort] = useState<number | null>(null);
+  
+  const [expandedCohort, setExpandedCohort] = useState<string | null>(null);
 
   const [rosterSearch, setRosterSearch] = useState('');
   const [rosterPage, setRosterPage] = useState(1);
   const studentsPerPage = 4;
 
   useEffect(() => {
-    const fetchAnalytics = async () => {
+    const fetchAssignedCohorts = async () => {
       setIsLoading(true);
       try {
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        
-        setCohortData([
-          { id: 1, cohort: 'Cohort Alpha 2026', averageScoreNum: 84, completionRateNum: 92, status: 'On Track' },
-          { id: 2, cohort: 'Cohort Beta 2026', averageScoreNum: 71, completionRateNum: 68, status: 'Needs Attention' },
-          { id: 3, cohort: 'Cohort Gamma 2026', averageScoreNum: 88, completionRateNum: 95, status: 'On Track' },
-        ]);
+        const { data: sessionData } = await supabase.auth.getUser();
+        const teacherId = sessionData?.user?.id;
 
+        if (!teacherId) return;
+
+        const { data: assignedCohorts, error } = await supabase
+          .from('Cohort Teachers')
+          .select(`
+            cohort_id,
+            Cohorts (
+              cohort_name,
+              account_status,
+              Users (
+                role_id,
+                "Student Attempts" (
+                  final_score
+                )
+              )
+            )
+          `)
+          .eq('teacher_id', teacherId);
+
+        if (error) throw error;
+
+        // 3. Process the nested data to calculate real averages
+        const formattedCohorts = assignedCohorts?.map(record => {
+          const cohortData = (record as any).Cohorts;
+          
+          // Filter to only include Learners (role_id === 1)
+          const students = cohortData.Users?.filter((u: any) => u.role_id === 1) || [];
+          
+          let totalScore = 0;
+          let totalAttempts = 0;
+          let studentsWithAttempts = 0;
+
+          students.forEach((student: any) => {
+            const attempts = student["Student Attempts"] || [];
+            if (attempts.length > 0) {
+              studentsWithAttempts++;
+              
+              attempts.forEach((attempt: any) => {
+                totalScore += (attempt.final_score || 0);
+                totalAttempts++;
+              });
+            }
+          });
+
+          const avgScore = totalAttempts > 0 
+            ? Math.round(totalScore / totalAttempts) 
+            : 0;
+
+          const completionRate = students.length > 0 
+            ? Math.round((studentsWithAttempts / students.length) * 100) 
+            : 0;
+
+          return {
+            id: (record as any).cohort_id,
+            cohort: cohortData.cohort_name,
+            averageScoreNum: avgScore,
+            completionRateNum: completionRate,
+            status: cohortData.account_status === 'Active' ? 'On Track' : 'Needs Attention'
+          };
+        }) || [];
+
+        setCohortData(formattedCohorts);
+
+        // TODO: Fetch real item analysis for exam questions 
         setItemAnalysis([
           { id: 'Q 402', exam: 'Midterm Coverage Quiz', topic: 'Neurotransmitters', failedBy: '65%' },
           { id: 'Q 411', exam: 'Midterm Coverage Quiz', topic: 'Brain Anatomy', failedBy: '42%' },
-          { id: 'Q 108', exam: 'Organizational Behavior Check', topic: 'Motivation Theories', failedBy: '58%' },
-        ]);
-
-        setMockStudents([
-          { id: 1, name: 'Juan Santos', grade: 88 },
-          { id: 2, name: 'Ana Reyes', grade: 92 },
-          { id: 3, name: 'Luis Cruz', grade: 65 },
-          { id: 4, name: 'Miguel Torres', grade: 78 },
-          { id: 5, name: 'Sofia Garcia', grade: 95 },
-          { id: 6, name: 'Diego Flores', grade: 72 },
-          { id: 7, name: 'Carmen Villanueva', grade: 85 }
         ]);
 
       } catch (error) {
-        console.error('Error fetching analytics', error);
+        console.error('Error fetching analytics:', error);
       } finally {
         setIsLoading(false);
       }
     };
 
-    fetchAnalytics();
+    fetchAssignedCohorts();
   }, []);
+
+  const toggleExpand = async (cohortId: string) => {
+    if (expandedCohort === cohortId) {
+      setExpandedCohort(null);
+      return;
+    } 
+    
+    setExpandedCohort(cohortId);
+    setRosterSearch('');
+    setRosterPage(1);
+    setIsLoadingRoster(true);
+
+    try {
+      const { data: students, error } = await supabase
+        .from('Users')
+        .select(`
+          user_id,
+          name,
+          "Student Attempts" (
+          final_score)`)
+        .eq('cohort_id', cohortId)
+        .eq('role_id', 1);
+
+      if (error) throw error;
+
+      const formattedStudents = students?.map((student: any) => {
+        const attempts = student.student_attempts || [];
+        let avgGrade = 0;
+
+        if (attempts.length > 0) {
+          const total = attempts.reduce((sum: number, attempt: any) => sum + (attempt.final_score || 0), 0);
+          avgGrade = Math.round(total / attempts.length);
+        }
+
+        return{
+        id: student.user_id,
+        name: student.name,
+        grade: attempts.length > 0 ? avgGrade : 'N/A'
+        };
+      }) || [];
+
+      setCohortStudents(formattedStudents);
+    } catch (error) {
+      console.error('Error fetching roster:', error);
+    } finally {
+      setIsLoadingRoster(false);
+    }
+  };
 
   const handleSort = (key: 'cohort' | 'averageScoreNum' | 'completionRateNum') => {
     if (sortKey === key) {
@@ -70,17 +170,7 @@ export default function FacultyAnalyticsPage() {
     return 0;
   });
 
-  const toggleExpand = (id: number) => {
-    if (expandedCohort === id) {
-      setExpandedCohort(null);
-    } else {
-      setExpandedCohort(id);
-      setRosterSearch('');
-      setRosterPage(1);
-    }
-  };
-
-  const filteredRoster = mockStudents.filter(student => 
+  const filteredRoster = cohortStudents.filter(student => 
     student.name.toLowerCase().includes(rosterSearch.toLowerCase())
   );
   
@@ -109,6 +199,10 @@ export default function FacultyAnalyticsPage() {
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
           </svg>
           <p className="text-slate-500 font-bold">Fetching cohort analytics...</p>
+        </div>
+      ) : cohortData.length === 0 ? (
+        <div className="flex flex-col items-center justify-center py-20 bg-white rounded-xl border border-slate-200">
+          <p className="text-slate-500 font-bold">You are not currently assigned to any active cohorts.</p>
         </div>
       ) : (
         <>
@@ -197,40 +291,48 @@ export default function FacultyAnalyticsPage() {
                                 />
                               </div>
                               
-                              {currentRosterStudents.length === 0 ? (
+                              {isLoadingRoster ? (
                                 <div className="py-6 text-center text-sm font-bold text-slate-500 bg-white border border-slate-200 rounded">
-                                  No students match your search.
+                                  Loading student roster...
+                                </div>
+                              ) : currentRosterStudents.length === 0 ? (
+                                <div className="py-6 text-center text-sm font-bold text-slate-500 bg-white border border-slate-200 rounded">
+                                  No students enrolled in this cohort yet.
                                 </div>
                               ) : (
                                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
                                   {currentRosterStudents.map(student => (
                                     <div key={student.id} className="bg-white border border-slate-200 p-3 rounded text-sm font-bold flex justify-between items-center shadow-sm">
                                       <span className="text-slate-700">{student.name}</span>
-                                      <span className={`${student.grade >= 75 ? 'text-emerald-600' : 'text-amber-600'}`}>{student.grade}%</span>
+                                      <span className={`${typeof student.grade === 'number' ? (student.grade >= 75 ? 'text-emerald-600' : 'text-amber-600') : 'text-slate-400'}`}>
+                                        {typeof student.grade === 'number' ? `${student.grade}%` : student.grade}
+                                      </span>
                                     </div>
                                   ))}
                                 </div>
                               )}
 
-                              <div className="flex justify-between items-center text-xs font-bold text-slate-500 pt-2 border-t border-slate-200">
-                                <span>Showing {filteredRoster.length > 0 ? indexOfFirstStudent + 1 : 0} to {Math.min(indexOfLastStudent, filteredRoster.length)} of {filteredRoster.length} students</span>
-                                <div className="flex gap-1.5">
-                                  <button 
-                                    onClick={() => setRosterPage(prev => Math.max(prev - 1, 1))}
-                                    disabled={rosterPage === 1}
-                                    className={`px-2.5 py-1 border rounded shadow-sm transition-colors ${rosterPage === 1 ? 'border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed' : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-100'}`}
-                                  >
-                                    Prev
-                                  </button>
-                                  <button 
-                                    onClick={() => setRosterPage(prev => Math.min(prev + 1, totalRosterPages))}
-                                    disabled={rosterPage === totalRosterPages || totalRosterPages === 0}
-                                    className={`px-2.5 py-1 border rounded shadow-sm transition-colors ${rosterPage === totalRosterPages || totalRosterPages === 0 ? 'border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed' : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-100'}`}
-                                  >
-                                    Next
-                                  </button>
+                              {!isLoadingRoster && currentRosterStudents.length > 0 && (
+                                <div className="flex justify-between items-center text-xs font-bold text-slate-500 pt-2 border-t border-slate-200">
+                                  <span>Showing {indexOfFirstStudent + 1} to {Math.min(indexOfLastStudent, filteredRoster.length)} of {filteredRoster.length} students</span>
+                                  <div className="flex gap-1.5">
+                                    <button 
+                                      onClick={() => setRosterPage(prev => Math.max(prev - 1, 1))}
+                                      disabled={rosterPage === 1}
+                                      className={`px-2.5 py-1 border rounded shadow-sm transition-colors ${rosterPage === 1 ? 'border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed' : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-100'}`}
+                                    >
+                                      Prev
+                                    </button>
+                                    <button 
+                                      onClick={() => setRosterPage(prev => Math.min(prev + 1, totalRosterPages))}
+                                      disabled={rosterPage === totalRosterPages || totalRosterPages === 0}
+                                      className={`px-2.5 py-1 border rounded shadow-sm transition-colors ${rosterPage === totalRosterPages || totalRosterPages === 0 ? 'border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed' : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-100'}`}
+                                    >
+                                      Next
+                                    </button>
+                                  </div>
                                 </div>
-                              </div>
+                              )}
                             </td>
                           </tr>
                         )}

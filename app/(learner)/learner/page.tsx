@@ -25,16 +25,22 @@ export default function LearnerCalendarPage() {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
 
-      // Query Exams and join the logged-in user's specific attempts
+      // Query Exams and join the logged-in user's attempts
+      // Graveyard Enforcer: Filter out 'Hidden' exams
       const { data: exams, error } = await supabase
         .from('Exams')
         .select(`
           exam_id,
           exam_title,
           schedule_start,
+          schedule_end,
           references,
-          attempts:"Student Attempts" ( exam_status )
+          max_attempts,
+          close_after_deadline,
+          global_status,
+          attempts:"Student Attempts" ( attempt_id )
         `)
+        .neq('global_status', 'Hidden')
         .order('schedule_start', { ascending: true });
 
       if (error) {
@@ -46,17 +52,27 @@ export default function LearnerCalendarPage() {
       // Format the raw database data to match UI requirements
       const formattedSchedule = exams.map((exam) => {
         const examDate = new Date(exam.schedule_start);
+        const examEndDate = exam.schedule_end ? new Date(exam.schedule_end) : null;
         const now = new Date();
         
-        // Check if the student has an existing attempt record
-        const studentAttempt = exam.attempts?.[0];
+        // Count existing attempts (RLS guarantees these belong to the current user)
+        const attemptCount = exam.attempts?.length || 0;
+        const maxAttempts = exam.max_attempts || 1;
         
-        // Determine the dynamic status
+        // Determine the dynamic status based on new attempt/deadline rules
         let currentStatus = 'Upcoming';
-        if (studentAttempt?.exam_status === 'completed') {
+        
+        if (attemptCount >= maxAttempts) {
           currentStatus = 'Completed';
-        } else if (examDate <= now) {
+        } else if (examEndDate && exam.close_after_deadline && now > examEndDate) {
+          currentStatus = 'Closed';
+        } else if (now >= examDate) {
           currentStatus = 'Pending';
+        }
+
+        let parsedRefs = ['Standard Syllabus Guide'];
+        if (exam.references && Array.isArray(exam.references) && exam.references.length > 0) {
+          parsedRefs = exam.references;
         }
 
         return {
@@ -66,7 +82,7 @@ export default function LearnerCalendarPage() {
           date: examDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric' }),
           time: examDate.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
           status: currentStatus,
-          references: exam.references || ['Standard Syllabus Guide'] // Fallback if no references exist
+          references: parsedRefs
         };
       });
 
@@ -77,7 +93,7 @@ export default function LearnerCalendarPage() {
     fetchSchedule();
   }, []);
 
-const today = new Date();
+  const today = new Date();
   const currentMonthName = today.toLocaleString('en-US', { month: 'long' });
   const currentYear = today.getFullYear();
   
@@ -98,52 +114,68 @@ const today = new Date();
       
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2 space-y-4">
-          {weeklySchedule.map((schedule, idx) => (
-            <div key={idx} className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-between gap-4">
-              <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-                <div>
-                  <h3 className="font-bold text-lg text-slate-800">{schedule.task}</h3>
-                  <p className="text-sm text-slate-500 mt-1">Scheduled for {schedule.day}, {schedule.date} at {schedule.time}</p>
-                </div>
-                <span className={`px-3 py-1.5 rounded-full text-xs font-bold ${
-                  schedule.status === 'Completed' ? 'bg-emerald-100 text-emerald-800' : 
-                  schedule.status === 'Pending' ? 'bg-blue-100 text-blue-800' : 
-                  'bg-slate-100 text-slate-600'
-                }`}>
-                  {schedule.status}
-                </span>
-              </div>
-
-              <div className="border-t border-slate-100 pt-3">
-                <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-2">Required Review References:</span>
-                <div className="flex flex-wrap gap-2">
-                  {schedule.references.map((ref, rIdx) => (
-                    <span key={rIdx} className="px-2.5 py-1 bg-slate-100 text-slate-700 text-xs font-bold rounded border border-slate-200">
-                      {ref}
-                    </span>
-                  ))}
-                </div>
-              </div>
-
-              <div className="flex justify-end gap-3 border-t border-slate-100 pt-3">
-                {schedule.status === 'Completed' && (
-                  <button onClick={() => router.push('/learner/exams')} className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-lg transition-colors shadow-sm">
-                    View Post Exam Dashboard
-                  </button>
-                )}
-                {schedule.status === 'Pending' && (
-                  <button onClick={() => router.push('/learner/exams')} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg transition-colors shadow-sm">
-                    Open Exam Selection
-                  </button>
-                )}
-                {schedule.status === 'Upcoming' && (
-                  <button disabled className="px-4 py-2 bg-slate-50 text-slate-400 border border-slate-100 text-xs font-bold rounded-lg cursor-not-allowed">
-                    Locked Until Scheduled Time
-                  </button>
-                )}
-              </div>
+          {isLoading ? (
+            <div className="p-12 text-center text-slate-500 font-bold bg-white rounded-xl border border-slate-200">
+              Syncing calendar data...
             </div>
-          ))}
+          ) : weeklySchedule.length === 0 ? (
+            <div className="p-12 text-center text-slate-500 font-bold bg-white rounded-xl border border-slate-200">
+              No scheduled activities found.
+            </div>
+          ) : (
+            weeklySchedule.map((schedule, idx) => (
+              <div key={idx} className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-between gap-4">
+                <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                  <div>
+                    <h3 className="font-bold text-lg text-slate-800">{schedule.task}</h3>
+                    <p className="text-sm text-slate-500 mt-1">Scheduled for {schedule.day}, {schedule.date} at {schedule.time}</p>
+                  </div>
+                  <span className={`px-3 py-1.5 rounded-full text-xs font-bold shrink-0 ${
+                    schedule.status === 'Completed' ? 'bg-emerald-100 text-emerald-800' : 
+                    schedule.status === 'Pending' ? 'bg-blue-100 text-blue-800' : 
+                    schedule.status === 'Closed' ? 'bg-rose-100 text-rose-800' :
+                    'bg-slate-100 text-slate-600'
+                  }`}>
+                    {schedule.status}
+                  </span>
+                </div>
+
+                <div className="border-t border-slate-100 pt-3">
+                  <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-2">Required Review References:</span>
+                  <div className="flex flex-wrap gap-2">
+                    {schedule.references.map((ref, rIdx) => (
+                      <span key={rIdx} className="px-2.5 py-1 bg-slate-100 text-slate-700 text-xs font-bold rounded border border-slate-200">
+                        {ref}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex justify-end gap-3 border-t border-slate-100 pt-3">
+                  {schedule.status === 'Completed' && (
+                    <button onClick={() => router.push('/learner/performance')} className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-lg transition-colors shadow-sm">
+                      View Performance Dashboard
+                    </button>
+                  )}
+                  {schedule.status === 'Pending' && (
+                    <button onClick={() => router.push('/learner/exams')} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg transition-colors shadow-sm">
+                      Open Exam Selection
+                    </button>
+                  )}
+                  {schedule.status === 'Closed' && (
+                    <button disabled className="px-4 py-2 bg-rose-50 text-rose-400 border border-rose-100 text-xs font-bold rounded-lg cursor-not-allowed">
+                      Exam Closed
+                    </button>
+                  )}
+                  {schedule.status === 'Upcoming' && (
+                    <button disabled className="px-4 py-2 bg-slate-50 text-slate-400 border border-slate-100 text-xs font-bold rounded-lg cursor-not-allowed">
+                      Locked Until Scheduled Time
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))
+          )}
         </div>
 
         <div className="lg:col-span-1 space-y-6">
@@ -181,7 +213,7 @@ const today = new Date();
             <h3 className="font-bold text-slate-800 mb-4">Weekly Goals Tracker</h3>
             <ul className="space-y-3 text-sm text-slate-600 font-bold">
               
-              {weeklySchedule.length === 0 ? (
+              {weeklySchedule.length === 0 && !isLoading ? (
                 <li className="text-slate-400 text-xs italic">No scheduled exams this week.</li>
               ) : (
                 weeklySchedule.map((exam, idx) => (
@@ -192,14 +224,18 @@ const today = new Date();
                       <span className="text-emerald-500 mt-0.5">✓</span>
                     ) : exam.status === 'Pending' ? (
                       <span className="text-blue-500 mt-0.5">○</span>
+                    ) : exam.status === 'Closed' ? (
+                      <span className="text-rose-400 mt-0.5">✗</span>
                     ) : (
                       <span className="text-slate-300 mt-0.5">○</span>
                     )}
                     
-                    {/* Dynamic Text with strikethrough for completed items */}
-                    <span className={exam.status === 'Completed' ? 'line-through text-slate-400' : 'text-slate-600'}>
+                    {/* Dynamic Text with strikethrough for completed/closed items */}
+                    <span className={exam.status === 'Completed' || exam.status === 'Closed' ? 'line-through text-slate-400' : 'text-slate-600'}>
                       {exam.status === 'Completed' 
-                        ? `Complete the ${exam.task}.` 
+                        ? `Completed: ${exam.task}` 
+                        : exam.status === 'Closed'
+                        ? `Missed: ${exam.task}`
                         : `Prepare for the upcoming ${exam.task}.`}
                     </span>
                   </li>

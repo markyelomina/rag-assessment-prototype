@@ -8,12 +8,13 @@ import Skeleton from "@/components/ui/Skeleton";
 interface ScheduledExam {
   id: string;
   title: string;
-  scope: string;
-  rules: string;
+  subject: string;
+  deadline: string;
   duration: string;
   status: string;
   score: string | null;
   accent: string;
+  timeLimit: number;
 }
 
 export default function ScheduledExamsPage() {
@@ -27,27 +28,71 @@ export default function ScheduledExamsPage() {
 
   useEffect(() => {
     const fetchExams = async () => {
+      setIsLoading(true);
       const {
         data: { user },
       } = await supabase.auth.getUser();
-      if (!user) return;
+      if (!user) {
+        setIsLoading(false);
+        return;
+      }
 
-      const { data: exams, error } = await supabase
+      // 1. Fetch the student's cohort_id from the Users table
+      const { data: userData, error: userError } = await supabase
+        .from("Users")
+        .select("cohort_id")
+        .eq("user_id", user.id)
+        .single();
+
+      if (userError || !userData?.cohort_id) {
+        console.error("Error fetching user cohort:", userError?.message);
+        setIsLoading(false);
+        return;
+      }
+
+      const studentCohortId = userData.cohort_id;
+
+      // 2. Find all exam IDs linked to this student's cohort
+      const { data: cohortExams, error: cohortExamsError } = await supabase
+        .from("Exam_Cohorts")
+        .select("exam_id")
+        .eq("cohort_id", studentCohortId);
+
+      if (cohortExamsError) {
+        console.error("Error fetching cohort exams:", cohortExamsError.message);
+        setIsLoading(false);
+        return;
+      }
+
+      const examIds = cohortExams?.map((ce) => ce.exam_id) || [];
+
+      if (examIds.length === 0) {
+        setScheduledExamsList([]);
+        setIsLoading(false);
+        return;
+      }
+
+      // 3. Fetch ONLY Active exams before the deadline (Pending and Inactive are hidden completely)
+      const nowIso = new Date().toISOString();
+
+      const { data: exams, error: examsError } = await supabase
         .from("Exams")
-        .select(
-          `
+        .select(`
           exam_id,
           exam_title,
           exam_subject,
-          schedule_start,
+          schedule_end,
           time_limit_mins,
-          attempts:"Student Attempts" ( exam_status, final_score )
-        `,
-        )
-        .order("schedule_start", { ascending: true });
+          global_status,
+          attempts:"Student Attempts" ( exam_status, final_score, student_id )
+        `)
+        .in("exam_id", examIds)
+        .eq("global_status", "Active") // Ensures Pending/Inactive are ignored
+        .gt("schedule_end", nowIso) // Ensures the deadline has not passed
+        .order("schedule_end", { ascending: true });
 
-      if (error) {
-        console.error("Error fetching exams:", error.message);
+      if (examsError) {
+        console.error("Error fetching exams:", examsError.message);
         setIsLoading(false);
         return;
       }
@@ -60,31 +105,36 @@ export default function ScheduledExamsPage() {
       ];
 
       const formattedExams = exams.map((exam: any, index: number) => {
-        const studentAttempt = exam.attempts?.[0];
-        const examDate = new Date(exam.schedule_start);
+        const studentAttempt = exam.attempts?.find(
+          (att: any) => att.student_id === user.id
+        );
+        const deadlineDate = new Date(exam.schedule_end);
 
         let currentStatus = "Available";
         let displayScore = null;
 
         if (studentAttempt?.exam_status === "completed") {
           currentStatus = "Finished";
-          displayScore = studentAttempt.final_score
+          displayScore = studentAttempt.final_score !== null && studentAttempt.final_score !== undefined
             ? `${studentAttempt.final_score}%`
             : "N/A";
         } else if (studentAttempt?.exam_status === "in_progress") {
           currentStatus = "In Progress";
-          displayScore = studentAttempt.final_score ? `${studentAttempt.final_score}%` : "N/A";
+          displayScore = studentAttempt.final_score !== null && studentAttempt.final_score !== undefined
+            ? `${studentAttempt.final_score}%`
+            : "N/A";
         }
 
         return {
           id: exam.exam_id,
           title: exam.exam_title,
-          scope: exam.exam_subject || "Comprehensive Coverage",
-          rules: `Specific Time ${examDate.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })} at ${examDate.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}`,
+          subject: exam.exam_subject || "General Comprehensive",
+          deadline: `${deadlineDate.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })} at ${deadlineDate.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}`,
           duration: `${exam.time_limit_mins || 60} minutes`,
           status: currentStatus,
           score: displayScore,
           accent: accentColors[index % accentColors.length],
+          timeLimit: exam.time_limit_mins || 60,
         };
       });
 
@@ -124,10 +174,10 @@ export default function ScheduledExamsPage() {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
               <div>
                 <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">
-                  Exam Scope
+                  Subject
                 </h4>
                 <p className="text-slate-800 font-bold text-lg">
-                  {examDetails?.scope}
+                  {examDetails?.subject}
                 </p>
               </div>
               <div>
@@ -140,12 +190,12 @@ export default function ScheduledExamsPage() {
               </div>
               <div className="md:col-span-2">
                 <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">
-                  Scheduling Rules
+                  Deadline
                 </h4>
                 <div className="flex items-center gap-3 mt-1">
-                  <span className="text-blue-600 text-2xl">🕒</span>
+                  <span className="text-blue-600 text-2xl">⏳</span>
                   <p className="text-slate-800 font-bold text-lg">
-                    {examDetails?.rules}
+                    {examDetails?.deadline}
                   </p>
                 </div>
               </div>
@@ -249,7 +299,7 @@ export default function ScheduledExamsPage() {
         </div>
       ) : scheduledExamsList.length === 0 ? (
         <div className="p-8 text-center text-slate-500 font-bold">
-          No exams are currently available for your account.
+          No active exams are currently available for your account.
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-8 w-full">
@@ -280,17 +330,17 @@ export default function ScheduledExamsPage() {
                   </div>
 
                   <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">
-                    Scope
+                    Subject
                   </p>
                   <p className="text-sm text-slate-700 font-bold mb-4">
-                    {exam.scope}
+                    {exam.subject}
                   </p>
 
                   <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-1">
-                    Schedule
+                    Deadline
                   </p>
                   <p className="text-sm text-slate-700 font-bold">
-                    {exam.rules}
+                    {exam.deadline}
                   </p>
                 </div>
 
@@ -325,4 +375,4 @@ export default function ScheduledExamsPage() {
       )}
     </div>
   );
-}
+} 

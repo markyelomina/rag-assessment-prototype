@@ -1,8 +1,9 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import EmptyState from '@/components/ui/EmptyState';
 import { usePagination } from '@/hooks/usePagination';
+import { supabase } from '@/lib/supabaseClient'; 
 
 export default function AdminLogsPage() {
   const [logSearch, setLogSearch] = useState('');
@@ -14,16 +15,49 @@ export default function AdminLogsPage() {
   
   const [selectedLog, setSelectedLog] = useState<any>(null);
 
-  const auditLogs = [
-    { id: 'LOG 8825', user: 'system rag', role: 'AI Engine', action: 'Vectorized newly uploaded document: Chapter_1.pdf', timestamp: '2026 07 11 02:15 PM', type: 'AI Engine', severity: 'Info', ip: 'Internal', browser: 'System Service' },
-    { id: 'LOG 8824', user: 'admin.mark@system.com', role: 'Admin', action: 'Created new custom role: Assistant Admin', timestamp: '2026 07 11 11:05 AM', type: 'Security', severity: 'Warning', ip: '192.168.1.104', browser: 'Chrome on MacOS' },
-    { id: 'LOG 8823', user: 'student.reyes@stud.edu', role: 'Learner', action: 'Started Mock Exam: Personality Theories Final', timestamp: '2026 07 10 01:20 PM', type: 'User Activity', severity: 'Info', ip: '192.168.1.205', browser: 'Safari on iOS' },
-    { id: 'LOG 8822', user: 'unknown ip', role: 'System', action: 'Failed login attempt (5x) for admin account', timestamp: '2026 07 10 11:05 AM', type: 'Security', severity: 'Critical', ip: '45.22.19.10', browser: 'Unknown Script' },
-    { id: 'LOG 8821', user: 'prof.marquez@univ.edu', role: 'Teacher', action: 'Uploaded document: Industrial_Psychology_Reviewer.pdf', timestamp: '2026 07 10 10:14 AM', type: 'Document Uploads', severity: 'Info', ip: '192.168.1.110', browser: 'Edge on Windows' },
-    { id: 'LOG 8820', user: 'system rag', role: 'AI Engine', action: 'Generated 50 mock questions for Cohort Alpha', timestamp: '2026 07 10 09:30 AM', type: 'AI Engine', severity: 'Info', ip: 'Internal', browser: 'System Service' },
-    { id: 'LOG 8819', user: 'student.santos@stud.edu', role: 'Learner', action: 'Completed Mock Exam: Abnormal Psychology Simulation', timestamp: '2026 07 10 08:45 AM', type: 'User Activity', severity: 'Info', ip: '192.168.1.201', browser: 'Chrome on Windows' },
-    { id: 'LOG 8818', user: 'admin.mark@system.com', role: 'Admin', action: 'Updated security access permissions for Teacher role', timestamp: '2026 07 09 04:15 PM', type: 'Security', severity: 'Warning', ip: '192.168.1.104', browser: 'Chrome on MacOS' },
-  ];
+  const [auditLogs, setAuditLogs] = useState<any[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    const fetchLogs = async () => {
+      setIsLoading(true);
+      const { data, error } = await supabase
+        .from('AuditLogs')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error("Error fetching logs:", error);
+        setIsLoading(false);
+        return;
+      }
+
+      const formattedLogs = data.map((log: any) => {
+        const dateObj = new Date(log.created_at);
+        const formattedTime = dateObj.toLocaleString('en-US', {
+          year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit', hour12: true
+        }).replace(/,/g, '').replace(/\//g, ' '); 
+
+        return {
+          id: `LOG ${log.log_id?.substring(0, 4).toUpperCase()}`, // Grabs first 4 chars of UUID
+          user: log.user_email || 'System',
+          role: log.role || 'System',
+          action: log.action,
+          timestamp: formattedTime,
+          type: log.type || 'System Event',
+          severity: log.severity || 'Info',
+          ip: log.ip_address || 'Unknown',
+          browser: log.user_agent || 'Unknown'
+        };
+      });
+
+      setAuditLogs(formattedLogs);
+      setIsLoading(false);
+    };
+
+    fetchLogs();
+  }, []);
 
   const filteredLogs = auditLogs.filter(log => {
     const matchesSearch = log.user.toLowerCase().includes(logSearch.toLowerCase()) || log.id.toLowerCase().includes(logSearch.toLowerCase());
@@ -137,7 +171,13 @@ export default function AdminLogsPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-xs md:text-sm text-slate-700">
-              {currentLogs.length === 0 ? (
+              {isLoading ? (
+                <tr>
+                  <td colSpan={6} className="p-12 text-center text-slate-500 font-bold">
+                    Fetching system logs...
+                  </td>
+                </tr>
+              ) : currentLogs.length === 0 ? (
                 <tr>
                   <td colSpan={6}>
                     <EmptyState 
