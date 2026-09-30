@@ -193,25 +193,42 @@ export default function AdminCohortsPage() {
   // --- Workspace Actions ---
   const handleAssignTeacher = async (teacherId: string) => {
     await supabase.from('Cohort Teachers').insert([{ cohort_id: selectedCohort, teacher_id: teacherId }]);
-    await logWorkspaceAction(`Assigned teacher ID ${teacherId} to cohort ID ${selectedCohort}`);
+    
+    // Fetch real names directly from the DB
+    const { data: teacher } = await supabase.from('Users').select('name').eq('user_id', teacherId).single();
+    const { data: cohort } = await supabase.from('Cohorts').select('cohort_name').eq('cohort_id', selectedCohort).single();
+    
+    await logWorkspaceAction(`Assigned teacher ${teacher?.name} to cohort ${cohort?.cohort_name}`);
     fetchCohortsData();
   };
 
   const handleRemoveTeacher = async (teacherId: string) => {
     await supabase.from('Cohort Teachers').delete().eq('cohort_id', selectedCohort).eq('teacher_id', teacherId);
-    await logWorkspaceAction(`Removed teacher ID ${teacherId} from cohort ID ${selectedCohort}`, 'Warning');
+    
+    const { data: teacher } = await supabase.from('Users').select('name').eq('user_id', teacherId).single();
+    const { data: cohort } = await supabase.from('Cohorts').select('cohort_name').eq('cohort_id', selectedCohort).single();
+    
+    await logWorkspaceAction(`Removed teacher ${teacher?.name} from cohort ${cohort?.cohort_name}`, 'Warning');
     fetchCohortsData();
   };
 
   const handleAddStudent = async (studentId: string) => {
     await supabase.from('Users').update({ cohort_id: selectedCohort }).eq('user_id', studentId);
-    await logWorkspaceAction(`Manually enrolled student ID ${studentId} into cohort ID ${selectedCohort}`);
+    
+    const { data: student } = await supabase.from('Users').select('name').eq('user_id', studentId).single();
+    const { data: cohort } = await supabase.from('Cohorts').select('cohort_name').eq('cohort_id', selectedCohort).single();
+    
+    await logWorkspaceAction(`Manually enrolled student ${student?.name} into cohort ${cohort?.cohort_name}`);
     fetchCohortsData();
   };
 
   const handleRemoveStudent = async (studentId: string) => {
     await supabase.from('Users').update({ cohort_id: null }).eq('user_id', studentId);
-    await logWorkspaceAction(`Removed student ID ${studentId} from cohort`, 'Warning');
+    
+    const { data: student } = await supabase.from('Users').select('name').eq('user_id', studentId).single();
+    const { data: cohort } = await supabase.from('Cohorts').select('cohort_name').eq('cohort_id', selectedCohort).single();
+    
+    await logWorkspaceAction(`Removed student ${student?.name} from cohort ${cohort?.cohort_name}`, 'Warning');
     fetchCohortsData();
   };
 
@@ -225,7 +242,10 @@ export default function AdminCohortsPage() {
 
     if (userIds.length > 0) {
       await supabase.from('Users').update({ cohort_id: selectedCohort }).in('user_id', userIds);
-      await logWorkspaceAction(`Batch assigned ${userIds.length} students to cohort ID ${selectedCohort}`);
+      
+      const { data: cohort } = await supabase.from('Cohorts').select('cohort_name').eq('cohort_id', selectedCohort).single();
+      
+      await logWorkspaceAction(`Batch assigned ${userIds.length} students to cohort ${cohort?.cohort_name}`);
       await fetchCohortsData();
     }
     

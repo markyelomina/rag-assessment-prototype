@@ -44,6 +44,19 @@ type Cohort = { id: string; name: string };
 
 const getSourceFromPath = (path: string) => path.split('/').pop() || path;
 
+// Converts Local HTML input format -> Strict UTC string for the database
+const localToUTC = (localString: string | null | undefined): string | null => {
+  if (!localString) return null;
+  // Manually split the string to avoid browser guessing games
+  const [datePart, timePart] = localString.split('T');
+  const [year, month, day] = datePart.split('-').map(Number);
+  const [hours, minutes] = timePart.split(':').map(Number);
+  
+  // This constructor explicitly forces the computer's local timezone
+  const d = new Date(year, month - 1, day, hours, minutes);
+  return d.toISOString();
+};
+
 export default function CreateExamPage() {
   const router = useRouter();
   const { addToast } = useToast();
@@ -203,14 +216,19 @@ export default function CreateExamPage() {
       : customBlocks.reduce((acc, block) => acc + block.count, 0);
     const exactPassingScore = Math.round(totalItems * (passingScorePercent / 100));
 
+    // Convert Local inputs -> strict UTC before inserting into the database
+    const scheduleStartUTC = localToUTC(scheduleStart);
+    const scheduleEndUTC = localToUTC(scheduleEnd);
+
     // 1. Insert parent record with status 'Generating' AND new settings
     const { error: dbError } = await supabase.from('Exams').insert({
       exam_id: sessionUUID,
       exam_title: examTitle,
       exam_subject: subject,
-      schedule_start: scheduleStart,
-      schedule_end: scheduleEnd,
+      schedule_start: scheduleStartUTC, 
+      schedule_end: scheduleEndUTC,
       passing_score: exactPassingScore,
+      passing_percentage: passingScorePercent,
       references: selectedMaterials, 
       time_limit_mins: timeLimit,
       global_status: 'Generating',
@@ -237,6 +255,41 @@ export default function CreateExamPage() {
       setErrors({ database: `Failed to assign cohorts: ${junctionError.message}` });
       setIsSubmitting(false);
       return;
+    }
+
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      const { data: userData } = await supabase
+        .from('Users')
+        .select(`
+          email,
+          Roles ( role_name )
+        `)
+        .eq('user_id', user.id)
+        .single();
+
+      const userEmail = userData?.email || user.email || 'System';
+      
+      let roleName = 'Teacher';
+      if (userData?.Roles) {
+        if (Array.isArray(userData.Roles) && userData.Roles.length > 0) {
+          roleName = (userData.Roles[0] as any).role_name || 'Teacher';
+        } else if (!Array.isArray(userData.Roles)) {
+          roleName = (userData.Roles as any).role_name || 'Teacher';
+        }
+      }
+
+      await supabase.from('AuditLogs').insert([
+        {
+          user_email: userEmail,
+          role: roleName,
+          action: `Created new exam: "${examTitle}" (${subject})`,
+          type: 'AI Engine',
+          severity: 'Info',
+          ip_address: 'Internal',
+          user_agent: navigator.userAgent
+        }
+      ]);
     }
 
     // 3. Trigger the asynchronous generation hook

@@ -1,11 +1,15 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import EmptyState from '@/components/ui/EmptyState';
 import { usePagination } from '@/hooks/usePagination';
+import { usePermissions } from '@/hooks/usePermissions';
 import { supabase } from '@/lib/supabaseClient'; 
 
 export default function AdminLogsPage() {
+  const router = useRouter();
+  const { viewLogs, isLoading: isPermissionsLoading } = usePermissions();
   const [logSearch, setLogSearch] = useState('');
   const [logDateFilter, setLogDateFilter] = useState('All Time');
   const [logTypeFilter, setLogTypeFilter] = useState('All Events');
@@ -18,8 +22,18 @@ export default function AdminLogsPage() {
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
+  // Security Bouncer
+  useEffect(() => {
+    if (!isPermissionsLoading && !viewLogs) {
+      router.push('/dashboard'); 
+    }
+  }, [isPermissionsLoading, viewLogs, router]);
+
   useEffect(() => {
     const fetchLogs = async () => {
+      // Don't fetch until we know they are allowed
+      if (isPermissionsLoading || !viewLogs) return;
+
       setIsLoading(true);
       const { data, error } = await supabase
         .from('AuditLogs')
@@ -57,7 +71,7 @@ export default function AdminLogsPage() {
     };
 
     fetchLogs();
-  }, []);
+  }, [isPermissionsLoading, viewLogs]);
 
   const filteredLogs = auditLogs.filter(log => {
     const matchesSearch = log.user.toLowerCase().includes(logSearch.toLowerCase()) || log.id.toLowerCase().includes(logSearch.toLowerCase());
@@ -81,6 +95,11 @@ export default function AdminLogsPage() {
     setLogDateFilter(e.target.value);
     resetPage();
   };
+
+  // Show a loading state while it checks Supabase permissions
+  if (isPermissionsLoading || !viewLogs) {
+    return <div className="p-12 text-center text-slate-500 font-bold mt-20">Verifying security clearance...</div>;
+  }
 
   return (
     <div className="space-y-6 relative">

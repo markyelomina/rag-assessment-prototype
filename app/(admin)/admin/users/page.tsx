@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import Badge from "@/components/ui/Badge";
 import EmptyState from "@/components/ui/EmptyState";
 import { useDebounce } from "@/hooks/useDebounce";
+import { usePermissions } from "@/hooks/usePermissions";
 import { supabase } from "@/lib/supabaseClient";
 
 interface UserProfile {
@@ -19,6 +20,10 @@ interface UserProfile {
 
 export default function AdminUsersPage() {
   const router = useRouter();
+  
+  // Security Bouncer Hook
+  const { manageUsers, isLoading: isPermissionsLoading } = usePermissions();
+
   const [userSearch, setUserSearch] = useState("");
   const debouncedUserSearch = useDebounce(userSearch, 300);
 
@@ -30,8 +35,20 @@ export default function AdminUsersPage() {
   const [dbCohorts, setDbCohorts] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
+  // Security Redirection
+  useEffect(() => {
+    if (!isPermissionsLoading && !manageUsers) {
+      router.push("/dashboard"); 
+    }
+  }, [isPermissionsLoading, manageUsers, router]);
+
   useEffect(() => {
     const fetchUsersAndCohorts = async () => {
+      // Don't fetch anything if they don't have permission yet
+      if (isPermissionsLoading || !manageUsers) return;
+
+      setIsLoading(true);
+
       // Fetch users and cohorts simultaneously
       const [usersResponse, cohortsResponse] = await Promise.all([
         supabase.from("Users").select(`
@@ -98,7 +115,7 @@ export default function AdminUsersPage() {
     };
 
     fetchUsersAndCohorts();
-  }, []);
+  }, [isPermissionsLoading, manageUsers]);
 
   const filteredUsers = allUsers.filter((user) => {
     const matchesSearch =
@@ -209,6 +226,11 @@ export default function AdminUsersPage() {
     }
   };
 
+  // Block rendering until permissions resolve
+  if (isPermissionsLoading || !manageUsers) {
+    return <div className="p-12 text-center text-slate-500 font-bold mt-20">Verifying security clearance...</div>;
+  }
+
   return (
     <div className="space-y-6 relative">
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
@@ -257,7 +279,6 @@ export default function AdminUsersPage() {
               className="px-4 py-2 border border-slate-300 rounded-lg text-sm font-bold focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white md:w-56"
             >
               <option value="All Cohorts">All Cohorts</option>
-              {/* Dynamically map active cohorts from DB */}
               {dbCohorts.map((name) => (
                 <option key={name} value={name}>
                   {name}

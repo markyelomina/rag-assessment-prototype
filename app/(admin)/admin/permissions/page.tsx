@@ -1,39 +1,90 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { supabase } from '@/lib/supabaseClient';
+import { useToast } from '@/components/ui/ToastContext';
+
+interface RoleData {
+  id: number;
+  name: string;
+  users: number;
+  permissions: { manageUsers: boolean; uploadDocs: boolean; viewLogs: boolean };
+  members: string[];
+  displayMembers: string[];
+}
 
 export default function AdminPermissionsPage() {
+  const { addToast } = useToast();
+  const [isLoading, setIsLoading] = useState(true);
   const [expandedRole, setExpandedRole] = useState<number | null>(null);
   const [showSaveModal, setShowSaveModal] = useState(false);
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newRoleName, setNewRoleName] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
 
-  const [roles, setRoles] = useState([
-    { 
-      id: 1, 
-      name: 'Admin', 
-      users: 3, 
-      permissions: { manageUsers: true, uploadDocs: true, viewLogs: true },
-      members: ['Mark Admin', 'System Root', 'Dev Ops']
-    },
-    { 
-      id: 2, 
-      name: 'Teacher / Faculty', 
-      users: 12, 
-      permissions: { manageUsers: false, uploadDocs: true, viewLogs: false },
-      members: ['Dr. Maria Marquez', 'Prof. Carlos Lim', 'Dr. Alan Turing', '+ 9 more faculty members']
-    },
-    { 
-      id: 3, 
-      name: 'Learner / Reviewer', 
-      users: 450, 
-      permissions: { manageUsers: false, uploadDocs: false, viewLogs: false },
-      members: ['Juan Santos', 'Ana Reyes', 'Luis Cruz', '+ 447 more enrolled students']
-    },
-  ]);
+  const [roles, setRoles] = useState<RoleData[]>([]);
 
+  // 1. Fetch Dynamic Roles and Users
+  const fetchRolesAndUsers = async () => {
+    setIsLoading(true);
+    
+    // Fetch Roles using your specific role_id
+    const { data: rolesData, error: rolesError } = await supabase
+      .from('Roles')
+      .select('*')
+      .order('role_id', { ascending: true });
+
+    // Fetch Users to map into their respective roles
+    const { data: usersData, error: usersError } = await supabase
+      .from('Users')
+      .select('name, role_id');
+
+    if (rolesError || usersError) {
+      addToast('Failed to load roles or users.', 'error');
+      setIsLoading(false);
+      return;
+    }
+
+    if (rolesData && usersData) {
+      const formattedRoles = rolesData.map((role: any) => {
+        // Filter users belonging to this role
+        const roleUsers = usersData
+          .filter((u: any) => u.role_id === role.role_id)
+          .map((u: any) => u.name || 'Unknown User');
+
+        // Format the members array for display
+        const displayMembers = roleUsers.length > 4 
+          ? [...roleUsers.slice(0, 3), `+ ${roleUsers.length - 3} more users`]
+          : (roleUsers.length > 0 ? roleUsers : ['No users assigned yet']);
+
+        return {
+          id: role.role_id,
+          name: role.role_name,
+          users: roleUsers.length,
+          permissions: {
+            manageUsers: role.manage_users || false,
+            uploadDocs: role.upload_docs || false,
+            viewLogs: role.view_logs || false
+          },
+          members: roleUsers,
+          displayMembers: displayMembers
+        };
+      });
+      
+      setRoles(formattedRoles);
+    }
+    setIsLoading(false);
+  };
+
+  useEffect(() => {
+    fetchRolesAndUsers();
+  }, []);
+
+  // 2. Local State Toggle for Permissions
   const togglePermission = (roleId: number, permissionKey: 'manageUsers' | 'uploadDocs' | 'viewLogs') => {
-    if (roleId === 1 && permissionKey === 'manageUsers') return;
+    // Prevent locking out the core Admin role
+    const targetRole = roles.find(r => r.id === roleId);
+    if (targetRole?.name === 'Admin' && permissionKey === 'manageUsers') return;
 
     setRoles(roles.map(role => {
       if (role.id === roleId) {
@@ -50,34 +101,68 @@ export default function AdminPermissionsPage() {
   };
 
   const toggleExpand = (roleId: number) => {
-    if (expandedRole === roleId) {
-      setExpandedRole(null);
-    } else {
-      setExpandedRole(roleId);
-    }
+    setExpandedRole(expandedRole === roleId ? null : roleId);
   };
 
-  const handleCreateRole = (e: React.FormEvent) => {
+  // 3. Create Custom Role in Database
+  const handleCreateRole = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newRoleName.trim()) return;
+    setIsSaving(true);
     
-    const newRole = {
-      id: Date.now(),
-      name: newRoleName,
-      users: 0,
-      permissions: { manageUsers: false, uploadDocs: false, viewLogs: false },
-      members: ['No users assigned yet']
-    };
-    
-    setRoles([...roles, newRole]);
-    setShowCreateModal(false);
-    setNewRoleName('');
+    const { error } = await supabase.from('Roles').insert([{
+      role_name: newRoleName,
+      manage_users: false,
+      upload_docs: false,
+      view_logs: false
+    }]);
+
+    if (error) {
+      addToast(`Error creating role: ${error.message}`, 'error');
+    } else {
+      addToast('New role created successfully.', 'success');
+      setNewRoleName('');
+      setShowCreateModal(false);
+      fetchRolesAndUsers(); // Refresh the list
+    }
+    setIsSaving(false);
   };
 
-  const handleSaveConfirmed = () => {
-    setShowSaveModal(false);
-    // Backend API call would happen here
+  // 4. Save Modified Permissions to Database
+  const handleSaveConfirmed = async () => {
+    setIsSaving(true);
+    
+    // Prepare the batch update payload based on current local state
+    const updatePromises = roles.map(role => 
+      supabase.from('Roles').update({
+        manage_users: role.permissions.manageUsers,
+        upload_docs: role.permissions.uploadDocs,
+        view_logs: role.permissions.viewLogs
+      }).eq('role_id', role.id) // Target your specific role_id column
+    );
+
+    const results = await Promise.all(updatePromises);
+    const hasError = results.some(res => res.error);
+
+    if (hasError) {
+      addToast('Some permissions failed to update.', 'error');
+    } else {
+      addToast('Global access permissions successfully saved.', 'success');
+      setShowSaveModal(false);
+    }
+    
+    setIsSaving(false);
   };
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <div className="p-12 text-center text-slate-500 font-bold bg-white rounded-xl border border-slate-200">
+          Syncing roles and permissions...
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6 relative">
@@ -180,13 +265,12 @@ export default function AdminPermissionsPage() {
                       <td colSpan={5} className="p-6 pl-10">
                         <h4 className="text-xs font-bold uppercase text-slate-500 mb-3">Assigned Members ({role.users})</h4>
                         <div className="flex flex-wrap gap-2">
-                          {role.members.map((member, idx) => (
+                          {role.displayMembers.map((member, idx) => (
                             <span key={idx} className="px-3 py-1.5 bg-white border border-slate-200 text-slate-700 text-xs font-bold rounded shadow-sm">
                               {member}
                             </span>
                           ))}
                         </div>
-                        <button className="mt-4 text-xs font-bold text-blue-600 hover:underline">View in Global User Directory</button>
                       </td>
                     </tr>
                   )}
@@ -196,7 +280,10 @@ export default function AdminPermissionsPage() {
           </table>
         </div>
         <div className="p-4 border-t border-slate-100 bg-slate-50 flex justify-end gap-3">
-          <button className="px-5 py-2 border border-slate-300 text-slate-700 text-sm font-bold rounded-lg hover:bg-white transition-colors shadow-sm">
+          <button 
+            onClick={() => fetchRolesAndUsers()} 
+            className="px-5 py-2 border border-slate-300 text-slate-700 text-sm font-bold rounded-lg hover:bg-white transition-colors shadow-sm"
+          >
             Discard Changes
           </button>
           <button 
@@ -225,15 +312,17 @@ export default function AdminPermissionsPage() {
             <div className="flex justify-end gap-3 pt-2">
               <button 
                 onClick={() => setShowSaveModal(false)}
-                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-bold rounded-lg transition-colors"
+                disabled={isSaving}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-bold rounded-lg transition-colors disabled:opacity-50"
               >
                 Cancel
               </button>
               <button 
                 onClick={handleSaveConfirmed}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold rounded-lg transition-colors"
+                disabled={isSaving}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold rounded-lg transition-colors flex items-center gap-2 disabled:opacity-50"
               >
-                Confirm Changes
+                {isSaving ? 'Saving...' : 'Confirm Changes'}
               </button>
             </div>
           </div>
@@ -262,7 +351,8 @@ export default function AdminPermissionsPage() {
                   onChange={(e) => setNewRoleName(e.target.value)}
                   placeholder="e.g. Assistant Admin" 
                   required
-                  className="w-full px-4 py-2 border border-slate-300 rounded-lg text-sm font-bold focus:outline-none focus:ring-1 focus:ring-blue-500" 
+                  disabled={isSaving}
+                  className="w-full px-4 py-2 border border-slate-300 rounded-lg text-sm font-bold focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:bg-slate-50 disabled:text-slate-500" 
                 />
                 <p className="text-xs font-bold text-slate-500 mt-2">New roles will start with zero active permissions by default. You can adjust them after creation.</p>
               </div>
@@ -271,15 +361,17 @@ export default function AdminPermissionsPage() {
                 <button 
                   type="button"
                   onClick={() => setShowCreateModal(false)}
-                  className="px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-bold rounded-lg transition-colors"
+                  disabled={isSaving}
+                  className="px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-bold rounded-lg transition-colors disabled:opacity-50"
                 >
                   Cancel
                 </button>
                 <button 
                   type="submit"
-                  className="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold rounded-lg transition-colors shadow-sm"
+                  disabled={isSaving}
+                  className="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold rounded-lg transition-colors shadow-sm disabled:opacity-50"
                 >
-                  Add Role
+                  {isSaving ? 'Creating...' : 'Add Role'}
                 </button>
               </div>
             </form>

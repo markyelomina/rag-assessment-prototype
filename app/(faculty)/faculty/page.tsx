@@ -36,8 +36,8 @@ export default function FacultyDashboardPage() {
         return;
       }
 
-      // 2. Fetch the specific profile from your Users table
-      const [profileResponse, examsResponse] = await Promise.all([
+      // 2. Fetch Profile, Exams (with items count), and Assigned Cohort Students
+      const [profileResponse, examsResponse, cohortsResponse] = await Promise.all([
         supabase
           .from('Users')
           .select('name')
@@ -45,26 +45,57 @@ export default function FacultyDashboardPage() {
           .single(),
         supabase
           .from('Exams')
-          .select('exam_id, exam_title, exam_subject, schedule_start, global_status, references')
+          .select(`
+            exam_id, 
+            exam_title, 
+            exam_subject, 
+            schedule_start, 
+            global_status, 
+            references,
+            "Mock Exam Items" ( exam_session_id )
+          `)
           //.eq('created_by', user.id)
-          .order('schedule_start', { ascending: false })
+          .order('schedule_start', { ascending: false }),
+        supabase
+          .from('Cohort Teachers')
+          .select(`
+            Cohorts (
+              Users (
+                role_id,
+                "Student Attempts" (
+                  exam_id
+                )
+              )
+            )
+          `)
+          .eq('teacher_id', user.id)
       ]);
+
+      if (cohortsResponse.error) {
+        console.error("COHORTS QUERY FAILED:", cohortsResponse.error);
+      }
 
       if (profileResponse.data?.name) {
         setFacultyName(profileResponse.data.name.split(' ')[0]);
       }
 
-      if (examsResponse.data) {
-        let activeCount = 0;
-        let pendingCount = 0;
+      let activeCount = 0;
+      let pendingCount = 0;
+      let activeExamIds: string[] = [];
+      let formattedExams: DashboardExam[] = [];
 
-        const formattedExams = examsResponse.data.map((exam: any) => {
+      if (examsResponse.data) {
+        formattedExams = examsResponse.data.map((exam: any) => {
           const dueDateObj = new Date(exam.schedule_start);
-          const totalItems = Array.isArray(exam.references) ? exam.references.length * 10 : 0;
+          
+          // Count items dynamically from the Mock Exam Items table
+          const totalItems = exam['Mock Exam Items']?.length || 0;
           const status = exam.global_status || 'Pending';
 
-          // Tally stats during the mapping process
-          if (status === 'Active') activeCount++;
+          if (status === 'Active') {
+            activeCount++;
+            activeExamIds.push(exam.exam_id); // Store ID for the completion calculation
+          }
           if (status === 'Pending') pendingCount++;
 
           return {
@@ -78,13 +109,44 @@ export default function FacultyDashboardPage() {
         });
 
         setExamsList(formattedExams);
-        setDashboardStats({
-          totalExams: formattedExams.length,
-          activeExams: activeCount,
-          pendingReviews: pendingCount,
-          overallCompletion: '92%' // Hardcoded for now
-        });
       }
+
+      // Calculate Overall Completion % dynamically
+      let completionText = 'N/A';
+      
+      if (cohortsResponse.data && activeExamIds.length > 0) {
+        // Flatten all students across all assigned cohorts
+        const allStudents = cohortsResponse.data.flatMap(record => {
+          const cohortData = (record as any).Cohorts;
+          return (cohortData?.Users || []).filter((u: any) => u.role_id === 1);
+        });
+
+        if (allStudents.length > 0) {
+          let completedAllCount = 0;
+
+          // Check if each student has an attempt logged for every active exam
+          allStudents.forEach(student => {
+            const attempts = student['Student Attempts'] || [];
+            const studentExamIds = attempts.map((a: any) => a.exam_id);
+            
+            const hasCompletedAll = activeExamIds.every(id => studentExamIds.includes(id));
+            if (hasCompletedAll) completedAllCount++;
+          });
+
+          completionText = Math.round((completedAllCount / allStudents.length) * 100) + '%';
+        } else {
+          completionText = '0%'; // Teacher has cohorts, but no students are enrolled yet
+        }
+      } else if (activeExamIds.length === 0) {
+        completionText = '100%'; // If there are 0 active exams, they are 100% caught up
+      }
+
+      setDashboardStats({
+        totalExams: formattedExams.length,
+        activeExams: activeCount,
+        pendingReviews: pendingCount,
+        overallCompletion: completionText
+      });
 
       setIsLoading(false);
     };
@@ -102,6 +164,12 @@ export default function FacultyDashboardPage() {
     if (status === 'Pending') return 'Review Questions';
     if (status === 'Inactive') return 'View Results';
     return 'Edit Settings';
+  };
+
+  const getActionRoute = (status: string, examId: string) => {
+    if (status === 'Pending') return `/faculty/exams?examId=${examId}&view=review`;
+    if (status === 'Inactive') return `/faculty/exams?examId=${examId}&view=results`;
+    return `/faculty/exams?examId=${examId}&view=edit`; // Default for Active
   };
 
   if (isLoading) {
@@ -123,7 +191,7 @@ export default function FacultyDashboardPage() {
           onClick={() => router.push('/faculty/exams/create')}
           className="px-6 py-2.5 bg-blue-600 text-white text-sm font-bold rounded-lg hover:bg-blue-700 transition-colors shadow-sm whitespace-nowrap"
         >
-          Create New Exam
+          + Create New Exam
         </button>
       </div>
 
@@ -202,7 +270,7 @@ export default function FacultyDashboardPage() {
                     <td className="p-6 font-bold text-slate-600">{exam.dueDate}</td>
                     <td className="p-6">
                       <button 
-                        onClick={() => router.push('/faculty/exams')}
+                        onClick={() => router.push(getActionRoute(exam.status, exam.id))}
                         className="text-xs font-bold text-blue-600 hover:underline"
                       >
                         {getActionLabel(exam.status)}

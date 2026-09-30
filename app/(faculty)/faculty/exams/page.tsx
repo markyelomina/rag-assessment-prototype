@@ -1,12 +1,13 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense } from 'react';
 import { useRouter } from 'next/navigation';
 import { useDebounce } from '@/hooks/useDebounce';
 import { usePagination } from '@/hooks/usePagination';
 import { supabase } from '@/lib/supabaseClient';
 import { useToast } from '@/components/ui/ToastContext';
 import { useRegeneration } from '@/hooks/useRegeneration';
+import { useSearchParams } from 'next/navigation';
 
 // --- Types ---
 interface FacultyExam {
@@ -111,9 +112,35 @@ const normalizeForComparison = (str: string) => {
     .toLowerCase();
 };
 
-export default function FacultyExamsPage() {
+// 1. Converts Database UTC time -> Local HTML input format
+const formatForInput = (utcString: string | null | undefined): string => {
+  if (!utcString) return '';
+  // Force browser to parse as UTC by appending 'Z' if it is missing
+  const safeString = utcString.includes('Z') || utcString.includes('+') ? utcString : `${utcString}Z`;
+  const d = new Date(safeString);
+  if (isNaN(d.getTime())) return '';
+  
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+
+// 2. Converts Local HTML input format -> Strict UTC string for the database
+const localToUTC = (localString: string | null | undefined): string | null => {
+  if (!localString) return null;
+  // Manually split the string to avoid browser guessing games
+  const [datePart, timePart] = localString.split('T');
+  const [year, month, day] = datePart.split('-').map(Number);
+  const [hours, minutes] = timePart.split(':').map(Number);
+  
+  // This constructor explicitly forces the computer's local timezone
+  const d = new Date(year, month - 1, day, hours, minutes);
+  return d.toISOString();
+};
+
+function FacultyExamsContent() {
   const router = useRouter();
   const { addToast } = useToast();
+  const searchParams = useSearchParams();
 
   const { regenerateItem, status: regenStatus, progressDetails: regenProgress } = useRegeneration();
 
@@ -163,6 +190,25 @@ export default function FacultyExamsPage() {
   const [isFetchingAnalytics, setIsFetchingAnalytics] = useState(false);
 
   const [questionAnalytics, setQuestionAnalytics] = useState<any[]>([]);
+
+  useEffect(() => {
+    const passedExamId = searchParams.get('examId');
+    const passedView = searchParams.get('view');
+
+    if (passedExamId) {
+      // Open the exam
+      setSelectedExam(passedExamId);
+
+      // Route to the correct tab based on the URL parameter
+      if (passedView === 'review') {
+        setExamTab('questions');
+      } else if (passedView === 'results') {
+        setExamTab('question_analytics'); 
+      } else if (passedView === 'edit') {
+        setExamTab('settings');
+      }
+    }
+  }, [searchParams]);
 
   // --- Fetch Exams ---
   useEffect(() => {
@@ -223,8 +269,8 @@ export default function FacultyExamsPage() {
             status: exam.global_status || 'Pending',
             startDateStr: exam.schedule_start ? new Date(exam.schedule_start).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date',
             endDateStr: exam.schedule_end ? new Date(exam.schedule_end).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date',
-            scheduleStart: exam.schedule_start ? new Date(exam.schedule_start).toISOString().slice(0, 16) : '',
-            scheduleEnd: exam.schedule_end ? new Date(exam.schedule_end).toISOString().slice(0, 16) : '',
+            scheduleStart: formatForInput(exam.schedule_start),
+            scheduleEnd: formatForInput(exam.schedule_end),
             passingScore: exam.passing_score || 0,
             timeLimit: exam.time_limit_mins || 60,
             maxAttempts: exam.max_attempts || 1,
@@ -437,10 +483,10 @@ export default function FacultyExamsPage() {
     if (exam.status === 'Generating') return;
     setSelectedExam(exam.id);
     setSelectedStudentForReview(null);
-    setHasAcknowledgedVoidWarning(false); // Reset warning cache for new exam
+    setHasAcknowledgedVoidWarning(false);
     if (exam.status === 'Pending') setExamTab('questions');
-    else if (exam.status === 'Inactive') setExamTab('analytics');
-    else setExamTab('settings'); // Hidden and Active default to settings
+    else if (exam.status === 'Inactive') setExamTab('question_analytics');
+    else setExamTab('settings');
   };
 
   const handleSaveSettings = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -449,8 +495,8 @@ export default function FacultyExamsPage() {
 
     const formData = new FormData(e.currentTarget);
     const title = formData.get('title') as string;
-    const scheduleStart = formData.get('scheduleStart') as string;
-    const scheduleEnd = formData.get('scheduleEnd') as string;
+    const rawScheduleStart = formData.get('scheduleStart') as string;
+    const rawScheduleEnd = formData.get('scheduleEnd') as string;
     const timeLimit = Number(formData.get('timeLimit'));
     const status = formData.get('status') as string;
     
@@ -458,12 +504,16 @@ export default function FacultyExamsPage() {
     const gradingLogic = formData.get('gradingLogic') as string;
     const closeAfterDeadline = formData.get('closeAfterDeadline') === 'on';
 
+    // Converts local browser input to true UTC ISO string before persisting to Supabase
+    const scheduleStartUTC = localToUTC(rawScheduleStart);
+    const scheduleEndUTC = localToUTC(rawScheduleEnd);
+
     const { error } = await supabase
       .from('Exams')
       .update({
         exam_title: title,
-        schedule_start: scheduleStart,
-        schedule_end: scheduleEnd,
+        schedule_start: scheduleStartUTC,
+        schedule_end: scheduleEndUTC,
         time_limit_mins: timeLimit,
         global_status: status,
         max_attempts: maxAttempts,
@@ -475,11 +525,21 @@ export default function FacultyExamsPage() {
     if (error) {
       addToast(`Error saving settings: ${error.message}`, 'error');
     } else {
-      const newStartDateStr = scheduleStart ? new Date(scheduleStart).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date';
-      const newEndDateStr = scheduleEnd ? new Date(scheduleEnd).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date';
+      const newStartDateStr = scheduleStartUTC ? new Date(scheduleStartUTC).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date';
+      const newEndDateStr = scheduleEndUTC ? new Date(scheduleEndUTC).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date';
 
       setExams(prev => prev.map(ex => ex.id === selectedExam ? {
-        ...ex, title, scheduleStart, scheduleEnd, timeLimit, status, startDateStr: newStartDateStr, endDateStr: newEndDateStr, maxAttempts, gradingLogic, closeAfterDeadline
+        ...ex,
+        title,
+        scheduleStart: rawScheduleStart,
+        scheduleEnd: rawScheduleEnd,
+        timeLimit,
+        status,
+        startDateStr: newStartDateStr,
+        endDateStr: newEndDateStr,
+        maxAttempts,
+        gradingLogic,
+        closeAfterDeadline
       } : ex));
       addToast('Exam settings successfully updated.', 'success');
     }
@@ -585,7 +645,7 @@ export default function FacultyExamsPage() {
   const getActionLabel = (status: string) => {
     if (status === 'Pending') return 'Review Questions';
     if (status === 'Inactive') return 'View Results';
-    return 'Manage Exam'; // Active and Hidden
+    return 'Manage Exam';
   };
 
   const getAIStatusStyle = (status: string) => {
@@ -758,7 +818,7 @@ export default function FacultyExamsPage() {
         correct_answer: vaultItem.correct_answer,
         rationale: vaultItem.rationale || 'Pulled from an archived validated exam.',
         citations: JSON.stringify(`Historical Exam Resource (Vault Item: ${vaultItem.id.slice(0,8)})`),
-        status: isValidationMode ? 'PASSED' : 'APPROVED' // Keep it approved if we are in maintenance mode
+        status: isValidationMode ? 'PASSED' : 'APPROVED'
     }).eq('id', itemToReplace.id);
 
     setAiQuestions(prev => prev.map(q => q.id === itemToReplace.id ? {
@@ -1523,5 +1583,19 @@ export default function FacultyExamsPage() {
       </div>
       )}
     </div>
+  );
+}
+
+export default function FacultyExamsPage() {
+  return (
+    <Suspense fallback={
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <div className="p-12 text-center text-slate-500 font-bold bg-white rounded-xl border border-slate-200">
+          Loading exam data...
+        </div>
+      </div>
+    }>
+      <FacultyExamsContent />
+    </Suspense>
   );
 }

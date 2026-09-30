@@ -20,75 +20,109 @@ export default function UnifiedPerformancePage() {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
 
-      // 1. Fetch all completed attempts and strictly filter out "Hidden" graveyard exams
-      const { data: attempts, error } = await supabase
+      const now = new Date();
+
+      // 1. Fetch ALL visible exams (to know what was required)
+      const { data: allExams, error: examsError } = await supabase
+        .from('Exams')
+        .select('exam_id, exam_title, exam_subject, schedule_start, schedule_end, close_after_deadline, global_status, grading_logic')
+        .neq('global_status', 'Hidden');
+
+      // 2. Fetch ONLY the current student's completed attempts
+      const { data: attempts, error: attemptsError } = await supabase
         .from('Student Attempts')
-        .select(`
-          attempt_id,
-          final_score,
-          completed_at,
-          exam_id,
-          exam:Exams!inner ( exam_title, exam_subject, global_status, grading_logic )
-        `)
+        .select('attempt_id, final_score, completed_at, exam_id')
         .eq('student_id', user.id)
         .eq('exam_status', 'completed')
-        .neq('exam.global_status', 'Hidden') // <-- The Graveyard Enforcer
-        .order('completed_at', { ascending: false }); 
+        .order('completed_at', { ascending: false });
 
-      if (error || !attempts || attempts.length === 0) {
+      if (examsError) {
         setIsLoading(false);
         setCohortRank("N/A");
         return;
       }
 
-      // 2. Consolidate attempts by exam_id applying the teacher's grading logic
-      const groupedAttempts = attempts.reduce((acc, curr) => {
-        if (!acc[curr.exam_id]) acc[curr.exam_id] = [];
-        acc[curr.exam_id].push(curr);
-        return acc;
-      }, {} as Record<string, any[]>);
+      // Group student's attempts by exam_id
+      const groupedAttempts: Record<string, any[]> = {};
+      if (attempts) {
+        attempts.forEach(a => {
+          if (!groupedAttempts[a.exam_id]) groupedAttempts[a.exam_id] = [];
+          groupedAttempts[a.exam_id].push(a);
+        });
+      }
 
-      const consolidatedHistory = Object.keys(groupedAttempts).map(examId => {
-        const group = groupedAttempts[examId];
-        // Since attempts are ordered by completed_at desc, group[0] is always the latest attempt
-        const latestAttempt = group[0]; 
-        const logic = latestAttempt.exam?.grading_logic || 'highest';
+      // 3. Build the consolidated history (including missed exams)
+      const consolidatedHistory: any[] = [];
+      const requiredExams = (allExams || []).filter(e => e.schedule_end && e.close_after_deadline && now > new Date(e.schedule_end));
 
-        let finalCalculatedScore = 0;
-        if (logic === 'highest') {
-          finalCalculatedScore = Math.max(...group.map(a => a.final_score || 0));
-        } else if (logic === 'average') {
-          const sum = group.reduce((acc, a) => acc + (a.final_score || 0), 0);
-          finalCalculatedScore = Math.round(sum / group.length);
+      (allExams || []).forEach(exam => {
+        const group = groupedAttempts[exam.exam_id];
+
+        if (group && group.length > 0) {
+          // They took the exam, calculate it based on grading logic
+          const latestAttempt = group[0]; 
+          const logic = exam.grading_logic || 'highest';
+
+          let finalCalculatedScore = 0;
+          if (logic === 'highest') {
+            finalCalculatedScore = Math.max(...group.map(a => a.final_score || 0));
+          } else if (logic === 'average') {
+            const sum = group.reduce((acc, a) => acc + (a.final_score || 0), 0);
+            finalCalculatedScore = Math.round(sum / group.length);
+          } else {
+            finalCalculatedScore = latestAttempt.final_score || 0; // 'latest'
+          }
+
+          const dateObj = new Date(latestAttempt.completed_at || Date.now());
+          
+          consolidatedHistory.push({
+            id: latestAttempt.attempt_id,
+            examId: exam.exam_id,
+            name: exam.exam_title || 'Unknown Exam',
+            subject: exam.exam_subject || 'General Assessment',
+            score: `${finalCalculatedScore}%`,
+            rawScore: finalCalculatedScore,
+            date: dateObj.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }),
+            status: finalCalculatedScore >= 75 ? 'Passed' : 'Needs Review',
+            attemptsCount: group.length,
+            gradingLogic: logic
+          });
         } else {
-          // 'latest'
-          finalCalculatedScore = latestAttempt.final_score || 0;
+          // They did NOT take it - check if it's considered "Missed"
+          const isRequiredAndMissed = requiredExams.some(re => re.exam_id === exam.exam_id);
+          
+          if (isRequiredAndMissed) {
+            const examEndDate = new Date(exam.schedule_end);
+            consolidatedHistory.push({
+              id: `missed-${exam.exam_id}`,
+              examId: exam.exam_id,
+              name: exam.exam_title || 'Unknown Exam',
+              subject: exam.exam_subject || 'General Assessment',
+              score: '0%',
+              rawScore: 0, // Zero score actively ruins their average
+              date: examEndDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }),
+              status: 'Missed',
+              attemptsCount: 0,
+              gradingLogic: exam.grading_logic || 'highest'
+            });
+          }
         }
-
-        const dateObj = new Date(latestAttempt.completed_at || Date.now());
-        
-        return {
-          id: latestAttempt.attempt_id,
-          examId: examId,
-          name: latestAttempt.exam?.exam_title || 'Unknown Exam',
-          subject: latestAttempt.exam?.exam_subject || 'General Assessment',
-          score: `${finalCalculatedScore}%`,
-          rawScore: finalCalculatedScore,
-          date: dateObj.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }),
-          status: finalCalculatedScore >= 75 ? 'Passed' : 'Needs Review',
-          attemptsCount: group.length,
-          gradingLogic: logic
-        };
       });
 
       // Sort consolidated history by date descending
       consolidatedHistory.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
-      // 3. Calculate Top-Level Stats
+      if (consolidatedHistory.length === 0) {
+        setIsLoading(false);
+        setCohortRank("N/A");
+        return;
+      }
+
+      // 4. Calculate Top-Level Stats (Now factoring in the 0s)
       const totalScore = consolidatedHistory.reduce((acc, curr) => acc + (curr.rawScore || 0), 0);
       const avg = Math.round(totalScore / consolidatedHistory.length);
 
-      // 4. Dynamically build Radar Chart based on actual tested subjects
+      // 5. Dynamically build Radar Chart (Now tracking missed subjects as 0)
       const subjectAverages: Record<string, { total: number; count: number }> = {};
       consolidatedHistory.forEach((h) => {
         if (!subjectAverages[h.subject]) subjectAverages[h.subject] = { total: 0, count: 0 };
@@ -108,14 +142,14 @@ export default function UnifiedPerformancePage() {
         dynamicRadarData.push({ subject: 'Retention', score: avg, fullMark: 100 });
       }
 
-      // 5. Dynamic AI Feedback
+      // 6. Dynamic AI Feedback
       let dynamicFeedback = "";
       if (avg >= 90) {
         dynamicFeedback = "Outstanding performance! Your historical data indicates a mastery of the core competencies. Keep up the excellent retention strategies.";
       } else if (avg >= 75) {
         dynamicFeedback = "Solid performance. You have a good grasp of most concepts, but targeted review in your lower-scoring subjects will push you to mastery.";
       } else {
-        dynamicFeedback = "Your performance indicates some fundamental gaps. It is highly recommended to review the core study materials and retake diagnostic exams.";
+        dynamicFeedback = "Your performance indicates some fundamental gaps. Missing exams or scoring low means it is highly recommended to review the core study materials and retake diagnostic exams.";
       }
 
       const mostRecent = consolidatedHistory[0];
@@ -130,7 +164,7 @@ export default function UnifiedPerformancePage() {
         radarData: dynamicRadarData
       });
 
-      // 6. Calculate Cohort Standing securely applying grading logic across all students
+      // 7. Calculate Cohort Standing securely applying grading logic AND penalizing the cohort for their missed exams too
       let calculatedRank = "N/A";
       const { data: userData } = await supabase.from('Users').select('cohort_id').eq('user_id', user.id).single();
       
@@ -144,63 +178,71 @@ export default function UnifiedPerformancePage() {
             .select('student_id, final_score, exam_id, completed_at, exam:Exams!inner (global_status, grading_logic)')
             .in('student_id', cohortUserIds)
             .eq('exam_status', 'completed')
-            .neq('exam.global_status', 'Hidden') // Graveyard enforcer for the entire cohort
+            .neq('exam.global_status', 'Hidden')
             .order('completed_at', { ascending: false });
 
-          if (cohortAttempts && cohortAttempts.length > 0) {
-            // Group: student_id -> exam_id -> array of attempts
-            const studentExamGroups: Record<string, Record<string, any[]>> = {};
-            
+          // Initialize all students in the cohort so they don't escape zeroes
+          const studentAverages: Record<string, { total: number; count: number }> = {};
+          cohortUserIds.forEach(id => studentAverages[id] = { total: 0, count: 0 });
+
+          // Group existing attempts
+          const studentExamGroups: Record<string, Record<string, any[]>> = {};
+          if (cohortAttempts) {
             cohortAttempts.forEach(ca => {
               if (!studentExamGroups[ca.student_id]) studentExamGroups[ca.student_id] = {};
               if (!studentExamGroups[ca.student_id][ca.exam_id]) studentExamGroups[ca.student_id][ca.exam_id] = [];
               studentExamGroups[ca.student_id][ca.exam_id].push(ca);
             });
+          }
 
-            const studentAverages: Record<string, { total: number; count: number }> = {};
-
-            Object.keys(studentExamGroups).forEach(studentId => {
-              studentAverages[studentId] = { total: 0, count: 0 };
-              const examsForStudent = studentExamGroups[studentId];
+          // Calculate scores based on grading logic
+          Object.keys(studentExamGroups).forEach(studentId => {
+            const examsForStudent = studentExamGroups[studentId];
+            Object.keys(examsForStudent).forEach(examId => {
+              const attemptsForExam = examsForStudent[examId];
+              const logic = attemptsForExam[0].exam?.grading_logic || 'highest';
               
-              Object.keys(examsForStudent).forEach(examId => {
-                const attemptsForExam = examsForStudent[examId];
-                const logic = attemptsForExam[0].exam?.grading_logic || 'highest';
-                
-                let score = 0;
-                if (logic === 'highest') {
-                  score = Math.max(...attemptsForExam.map(a => a.final_score || 0));
-                } else if (logic === 'average') {
-                  const sum = attemptsForExam.reduce((s, a) => s + (a.final_score || 0), 0);
-                  score = sum / attemptsForExam.length;
-                } else {
-                  score = attemptsForExam[0].final_score || 0; // 'latest'
-                }
+              let score = 0;
+              if (logic === 'highest') score = Math.max(...attemptsForExam.map(a => a.final_score || 0));
+              else if (logic === 'average') {
+                const sum = attemptsForExam.reduce((s, a) => s + (a.final_score || 0), 0);
+                score = sum / attemptsForExam.length;
+              } else score = attemptsForExam[0].final_score || 0; // 'latest'
 
-                studentAverages[studentId].total += score;
-                studentAverages[studentId].count += 1;
-              });
+              studentAverages[studentId].total += score;
+              studentAverages[studentId].count += 1;
             });
+          });
 
-            const rankList = Object.keys(studentAverages).map(sid => ({
-              id: sid,
-              avg: studentAverages[sid].total / studentAverages[sid].count
-            })).sort((a, b) => b.avg - a.avg);
-
-            const myRankIndex = rankList.findIndex(r => r.id === user.id);
-            if (myRankIndex !== -1) {
-              const myRank = myRankIndex + 1;
-              const totalStudents = rankList.length;
-              
-              if (totalStudents > 1) {
-                const percentile = Math.ceil((myRank / totalStudents) * 100);
-                if (percentile <= 10) calculatedRank = "Top 10%";
-                else if (percentile <= 25) calculatedRank = "Top 25%";
-                else if (percentile <= 50) calculatedRank = "Top 50%";
-                else calculatedRank = `Rank ${myRank} of ${totalStudents}`;
-              } else {
-                calculatedRank = "Top 1%"; 
+          // Enforce zeroes for missed exams across the whole cohort
+          cohortUserIds.forEach(studentId => {
+            const examsForStudent = studentExamGroups[studentId] || {};
+            requiredExams.forEach(reqExam => {
+              if (!examsForStudent[reqExam.exam_id]) {
+                studentAverages[studentId].total += 0;
+                studentAverages[studentId].count += 1;
               }
+            });
+          });
+
+          const rankList = Object.keys(studentAverages).map(sid => ({
+            id: sid,
+            avg: studentAverages[sid].count > 0 ? (studentAverages[sid].total / studentAverages[sid].count) : 0
+          })).sort((a, b) => b.avg - a.avg);
+
+          const myRankIndex = rankList.findIndex(r => r.id === user.id);
+          if (myRankIndex !== -1) {
+            const myRank = myRankIndex + 1;
+            const totalStudents = rankList.length;
+            
+            if (totalStudents > 1) {
+              const percentile = Math.ceil((myRank / totalStudents) * 100);
+              if (percentile <= 10) calculatedRank = "Top 10%";
+              else if (percentile <= 25) calculatedRank = "Top 25%";
+              else if (percentile <= 50) calculatedRank = "Top 50%";
+              else calculatedRank = `Rank ${myRank} of ${totalStudents}`;
+            } else {
+              calculatedRank = "Top 1%"; 
             }
           }
         }
@@ -305,7 +347,7 @@ export default function UnifiedPerformancePage() {
         <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
             <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-center">
-              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Unique Exams Completed</span>
+              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Total Evaluated Exams</span>
               <p className="text-4xl font-bold text-slate-800 mt-2">{stats.completed}</p>
             </div>
             <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-center">
@@ -342,7 +384,11 @@ export default function UnifiedPerformancePage() {
                       <td className="p-4 font-bold text-slate-700">{exam.score}</td>
                       <td className="p-4 text-slate-500 font-bold">{exam.date}</td>
                       <td className="p-4">
-                        <span className={`inline-block px-3 py-1 rounded text-xs font-bold uppercase tracking-wider ${exam.status === 'Passed' ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'}`}>
+                        <span className={`inline-block px-3 py-1 rounded text-xs font-bold uppercase tracking-wider ${
+                          exam.status === 'Passed' ? 'bg-emerald-50 text-emerald-700' : 
+                          exam.status === 'Missed' ? 'bg-rose-50 text-rose-700' : 
+                          'bg-amber-50 text-amber-700'
+                        }`}>
                           {exam.status}
                         </span>
                       </td>
