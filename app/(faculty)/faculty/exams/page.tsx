@@ -15,6 +15,7 @@ interface FacultyExam {
   title: string;
   target: string;
   cohorts: string[];
+  cohortIds: string[]; 
   items: number;
   status: string;
   startDateStr: string;
@@ -47,14 +48,22 @@ interface StudentReviewItem {
   studentAnswer: string;
   correctAnswer: string;
   isCorrect: boolean;
+  explanation: string;
+}
+
+interface AttemptRecord {
+  attemptId: string;
+  score: number;
+  rawScore: number;
+  maxScore: number;
+  status: string;
+  takenAt: string;
+  items: StudentReviewItem[];
 }
 
 interface SelectedStudentReview {
   name: string;
-  grade: string;
-  rawScore: number;
-  takenAt: string;
-  items: StudentReviewItem[];
+  attempts: AttemptRecord[];
 }
 
 // --- Helper Functions ---
@@ -112,10 +121,8 @@ const normalizeForComparison = (str: string) => {
     .toLowerCase();
 };
 
-// 1. Converts Database UTC time -> Local HTML input format
 const formatForInput = (utcString: string | null | undefined): string => {
   if (!utcString) return '';
-  // Force browser to parse as UTC by appending 'Z' if it is missing
   const safeString = utcString.includes('Z') || utcString.includes('+') ? utcString : `${utcString}Z`;
   const d = new Date(safeString);
   if (isNaN(d.getTime())) return '';
@@ -124,17 +131,22 @@ const formatForInput = (utcString: string | null | undefined): string => {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 };
 
-// 2. Converts Local HTML input format -> Strict UTC string for the database
 const localToUTC = (localString: string | null | undefined): string | null => {
   if (!localString) return null;
-  // Manually split the string to avoid browser guessing games
   const [datePart, timePart] = localString.split('T');
   const [year, month, day] = datePart.split('-').map(Number);
   const [hours, minutes] = timePart.split(':').map(Number);
   
-  // This constructor explicitly forces the computer's local timezone
   const d = new Date(year, month - 1, day, hours, minutes);
   return d.toISOString();
+};
+
+const formatAttemptDate = (isoString: string) => {
+  if (!isoString) return 'Pending';
+  const d = new Date(isoString);
+  const dateStr = `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear().toString().slice(-2)}`;
+  const timeStr = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  return `${dateStr}, ${timeStr}`;
 };
 
 function FacultyExamsContent() {
@@ -144,12 +156,10 @@ function FacultyExamsContent() {
 
   const { regenerateItem, status: regenStatus, progressDetails: regenProgress } = useRegeneration();
 
-  // Navigation & Tabs
   const [selectedExam, setSelectedExam] = useState<null | string>(null);
   const [examTab, setExamTab] = useState('settings');
   const [validationTab, setValidationTab] = useState<'pending' | 'approved'>('pending');
 
-  // Search & Filtering
   const [examSearchQuery, setExamSearchQuery] = useState('');
   const debouncedExamSearch = useDebounce(examSearchQuery, 300);
   const [examStatusFilter, setExamStatusFilter] = useState('All');
@@ -158,11 +168,13 @@ function FacultyExamsContent() {
   const debouncedStudentSearch = useDebounce(studentSearch, 300);
   const [studentStatusFilter, setStudentStatusFilter] = useState('All');
 
-  // Selection & Action States
   const [selectedQuestions, setSelectedQuestions] = useState<string[]>([]);
   const [regeneratingItems, setRegeneratingItems] = useState<string[]>([]);
 
-  // Modals & Sub-views
+  const [teacherCohorts, setTeacherCohorts] = useState<{id: string, name: string}[]>([]);
+  const [editSelectedCohorts, setEditSelectedCohorts] = useState<string[]>([]);
+  const [isCohortDropdownOpen, setIsCohortDropdownOpen] = useState(false);
+
   const [showRegenerateModal, setShowRegenerateModal] = useState(false);
   const [questionToRegenerate, setQuestionToRegenerate] = useState<null | string>(null);
 
@@ -172,23 +184,22 @@ function FacultyExamsContent() {
   const [showActivationModal, setShowActivationModal] = useState(false);
   const [pendingApprovalAction, setPendingApprovalAction] = useState<(() => void) | null>(null);
 
-  // MAINTENANCE MODE WARNING STATE
   const [hasAcknowledgedVoidWarning, setHasAcknowledgedVoidWarning] = useState(false);
   const [showVoidWarningModal, setShowVoidWarningModal] = useState(false);
   const [pendingMaintenanceAction, setPendingMaintenanceAction] = useState<(() => void) | null>(null);
 
-  // Student Review Sub-View
+  // Student Review Sub-View States
   const [selectedStudentForReview, setSelectedStudentForReview] = useState<SelectedStudentReview | null>(null);
+  const [activeAttemptIndex, setActiveAttemptIndex] = useState(0);
+  const [isReviewDropdownOpen, setIsReviewDropdownOpen] = useState(false);
   const [isLoadingReview, setIsLoadingReview] = useState(false);
 
-  // Data States
   const [isLoading, setIsLoading] = useState(true);
   const [exams, setExams] = useState<FacultyExam[]>([]);
   const [aiQuestions, setAiQuestions] = useState<ValidationItem[]>([]);
 
   const [studentAnalytics, setStudentAnalytics] = useState<any[]>([]);
   const [isFetchingAnalytics, setIsFetchingAnalytics] = useState(false);
-
   const [questionAnalytics, setQuestionAnalytics] = useState<any[]>([]);
 
   useEffect(() => {
@@ -196,10 +207,8 @@ function FacultyExamsContent() {
     const passedView = searchParams.get('view');
 
     if (passedExamId) {
-      // Open the exam
       setSelectedExam(passedExamId);
 
-      // Route to the correct tab based on the URL parameter
       if (passedView === 'review') {
         setExamTab('questions');
       } else if (passedView === 'results') {
@@ -210,7 +219,6 @@ function FacultyExamsContent() {
     }
   }, [searchParams]);
 
-  // --- Fetch Exams ---
   useEffect(() => {
     const fetchFacultyExams = async () => {
       const { data: { user } } = await supabase.auth.getUser();
@@ -218,10 +226,16 @@ function FacultyExamsContent() {
 
       const { data: userCohorts } = await supabase
         .from('Cohort Teachers')
-        .select('cohort_id')
+        .select('cohort_id, Cohorts(cohort_name)')
         .eq('teacher_id', user.id);
 
       const cohortIds = userCohorts?.map(c => c.cohort_id) || [];
+      const fetchedTeacherCohorts = userCohorts?.map(c => ({
+        id: c.cohort_id,
+        name: (c.Cohorts as any)?.cohort_name || 'Unknown Cohort'
+      })) || [];
+      
+      setTeacherCohorts(fetchedTeacherCohorts);
 
       if (cohortIds.length === 0) {
         setExams([]);
@@ -245,9 +259,9 @@ function FacultyExamsContent() {
       const { data: dbExams, error } = await supabase
         .from('Exams')
         .select(`
-          exam_id, exam_title, exam_subject, schedule_start, schedule_end, passing_score, time_limit_mins, global_status, references,
+          exam_id, exam_title, exam_subject, schedule_start, schedule_end, passing_score, passing_percentage, time_limit_mins, global_status, references,
           max_attempts, close_after_deadline, grading_logic,
-          Exam_Cohorts ( Cohorts ( cohort_name ) ),
+          Exam_Cohorts ( cohort_id, Cohorts ( cohort_name ) ),
           "Mock Exam Items" ( id )
         `)
         .in('exam_id', examIds)
@@ -258,20 +272,23 @@ function FacultyExamsContent() {
 
         const formattedExams = dbExams.map((exam: any, index: number) => {
           const cohortsList = exam.Exam_Cohorts?.map((ec: any) => ec.Cohorts?.cohort_name).filter(Boolean) || [];
+          const cohortIdList = exam.Exam_Cohorts?.map((ec: any) => ec.cohort_id).filter(Boolean) || [];
           const itemCount = exam['Mock Exam Items'] ? exam['Mock Exam Items'].length : 0;
+          const targetPassingScore = exam.passing_percentage || exam.passing_score || 0;
 
           return {
             id: exam.exam_id,
             title: exam.exam_title,
             target: exam.exam_subject || 'Comprehensive',
             cohorts: cohortsList,
+            cohortIds: cohortIdList,
             items: itemCount,
             status: exam.global_status || 'Pending',
             startDateStr: exam.schedule_start ? new Date(exam.schedule_start).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date',
             endDateStr: exam.schedule_end ? new Date(exam.schedule_end).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date',
             scheduleStart: formatForInput(exam.schedule_start),
             scheduleEnd: formatForInput(exam.schedule_end),
-            passingScore: exam.passing_score || 0,
+            passingScore: targetPassingScore, 
             timeLimit: exam.time_limit_mins || 60,
             maxAttempts: exam.max_attempts || 1,
             closeAfterDeadline: exam.close_after_deadline ?? true,
@@ -285,15 +302,10 @@ function FacultyExamsContent() {
     };
 
     fetchFacultyExams();
-
-    const interval = setInterval(() => {
-      fetchFacultyExams();
-    }, 15000);
-
+    const interval = setInterval(() => { fetchFacultyExams(); }, 15000);
     return () => clearInterval(interval);
   }, []);
 
-  // --- Fetch Questions for Validation Tab ---
   const fetchExamQuestions = React.useCallback(async () => {
     if (!selectedExam) return;
     const { data } = await supabase
@@ -346,12 +358,14 @@ function FacultyExamsContent() {
     fetchExamQuestions();
   }, [fetchExamQuestions]);
 
-  // --- Fetch Student Analytics ---
   useEffect(() => {
     const fetchAnalytics = async () => {
-      if (!selectedExam || examTab !== 'analytics') return;
+      if (!selectedExam || examTab !== 'gradebook') return;
       setIsFetchingAnalytics(true);
-      setSelectedStudentForReview(null);
+
+      const currentExamConfig = exams.find(e => e.id === selectedExam);
+      const gradingRule = currentExamConfig?.gradingLogic || 'highest';
+      const totalItems = currentExamConfig?.items || 0;
 
       const { data: ecData } = await supabase.from('Exam_Cohorts').select('cohort_id').eq('exam_id', selectedExam);
       const cohortIds = ecData?.map(ec => ec.cohort_id) || [];
@@ -366,23 +380,31 @@ function FacultyExamsContent() {
         .from('Student Attempts')
         .select('*')
         .eq('exam_id', selectedExam)
-        .order('completed_at', { ascending: false });
+        .order('completed_at', { ascending: true }); // Earliest first
 
       const mergedData = students.map(st => {
-        const attempt = attemptsData?.find(a => a.student_id === st.user_id);
-        const isCompleted = attempt?.exam_status?.toLowerCase() === 'completed';
-        const hasScore = attempt?.final_score !== null && attempt?.final_score !== undefined;
+        const studentAttempts = attemptsData?.filter(a => a.student_id === st.user_id) || [];
+        const isCompleted = studentAttempts.length > 0 && studentAttempts.some(a => a.exam_status?.toLowerCase() === 'completed');
 
-        const gradeText = hasScore ? `${attempt.final_score}%` : 'Pending';
+        let calculatedFinalGrade: number | string = 'Pending';
+        let calculatedRawScore: number | string = 'Pending';
+
+        if (studentAttempts.length > 0) {
+           const scores = studentAttempts.map(a => a.final_score || 0);
+           if (gradingRule === 'highest') calculatedFinalGrade = Math.max(...scores);
+           else if (gradingRule === 'latest') calculatedFinalGrade = scores[scores.length - 1];
+           else if (gradingRule === 'average') calculatedFinalGrade = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
+           
+           // Derive raw score from the final percentage grade stored in DB
+           calculatedRawScore = Math.round((Number(calculatedFinalGrade) / 100) * totalItems);
+        }
 
         return {
           id: st.user_id,
-          attemptId: attempt?.attempt_id || null,
           name: st.name,
-          status: attempt ? (isCompleted ? 'Completed' : 'In Progress') : 'Not Taken',
-          takenAt: attempt?.completed_at ? new Date(attempt.completed_at).toLocaleString() : 'Pending',
-          grade: gradeText,
-          rawScore: attempt?.final_score ?? 0
+          status: studentAttempts.length > 0 ? (isCompleted ? 'Completed' : 'In Progress') : 'Not Taken',
+          attempts: studentAttempts,
+          grade: calculatedFinalGrade === 'Pending' ? 'Pending' : `${calculatedRawScore} / ${totalItems}`
         };
       });
 
@@ -390,9 +412,8 @@ function FacultyExamsContent() {
       setIsFetchingAnalytics(false);
     };
     fetchAnalytics();
-  }, [selectedExam, examTab]);
+  }, [selectedExam, examTab, exams]);
 
-  // --- Fetch Question Analytics ---
   useEffect(() => {
     const fetchQuestionAnalytics = async () => {
       if (!selectedExam || examTab !== 'question_analytics') return;
@@ -463,10 +484,8 @@ function FacultyExamsContent() {
     fetchQuestionAnalytics();
   }, [selectedExam, examTab]);
 
-  // --- Derived States ---
   const currentExam = exams.find(e => e.id === selectedExam);
   
-  // Logic states
   const isValidationMode = currentExam?.status === 'Pending';
   const isMaintenanceMode = currentExam?.status === 'Hidden';
   const isReadOnly = currentExam?.status === 'Active' || currentExam?.status === 'Inactive';
@@ -478,12 +497,15 @@ function FacultyExamsContent() {
     ? (validationTab === 'pending' ? pendingQuestions : approvedQuestions) 
     : aiQuestions;
 
-  // --- Handlers ---
   const handleExamClick = (exam: FacultyExam) => {
     if (exam.status === 'Generating') return;
     setSelectedExam(exam.id);
     setSelectedStudentForReview(null);
     setHasAcknowledgedVoidWarning(false);
+    
+    setEditSelectedCohorts(exam.cohortIds || []);
+    setIsCohortDropdownOpen(false);
+
     if (exam.status === 'Pending') setExamTab('questions');
     else if (exam.status === 'Inactive') setExamTab('question_analytics');
     else setExamTab('settings');
@@ -492,6 +514,11 @@ function FacultyExamsContent() {
   const handleSaveSettings = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     if (!selectedExam) return;
+
+    if (editSelectedCohorts.length === 0) {
+      addToast('You must assign at least one cohort to this exam.', 'error');
+      return;
+    }
 
     const formData = new FormData(e.currentTarget);
     const title = formData.get('title') as string;
@@ -504,7 +531,6 @@ function FacultyExamsContent() {
     const gradingLogic = formData.get('gradingLogic') as string;
     const closeAfterDeadline = formData.get('closeAfterDeadline') === 'on';
 
-    // Converts local browser input to true UTC ISO string before persisting to Supabase
     const scheduleStartUTC = localToUTC(rawScheduleStart);
     const scheduleEndUTC = localToUTC(rawScheduleEnd);
 
@@ -524,25 +550,69 @@ function FacultyExamsContent() {
 
     if (error) {
       addToast(`Error saving settings: ${error.message}`, 'error');
-    } else {
-      const newStartDateStr = scheduleStartUTC ? new Date(scheduleStartUTC).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date';
-      const newEndDateStr = scheduleEndUTC ? new Date(scheduleEndUTC).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date';
-
-      setExams(prev => prev.map(ex => ex.id === selectedExam ? {
-        ...ex,
-        title,
-        scheduleStart: rawScheduleStart,
-        scheduleEnd: rawScheduleEnd,
-        timeLimit,
-        status,
-        startDateStr: newStartDateStr,
-        endDateStr: newEndDateStr,
-        maxAttempts,
-        gradingLogic,
-        closeAfterDeadline
-      } : ex));
-      addToast('Exam settings successfully updated.', 'success');
+      return;
     }
+
+    const { error: deleteError } = await supabase.from('Exam_Cohorts').delete().eq('exam_id', selectedExam);
+    if (!deleteError) {
+      const cohortPayload = editSelectedCohorts.map(id => ({ exam_id: selectedExam, cohort_id: id }));
+      await supabase.from('Exam_Cohorts').insert(cohortPayload);
+    }
+
+    // ---> NEW: Log the exam update to AuditLogs
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user) {
+      const { data: userData } = await supabase
+        .from('Users')
+        .select(`email, Roles ( role_name )`)
+        .eq('user_id', user.id)
+        .single();
+
+      const userEmail = userData?.email || user.email || 'System';
+      
+      let roleName = 'Teacher';
+      if (userData?.Roles) {
+        if (Array.isArray(userData.Roles) && userData.Roles.length > 0) {
+          roleName = (userData.Roles[0] as any).role_name || 'Teacher';
+        } else if (!Array.isArray(userData.Roles)) {
+          roleName = (userData.Roles as any).role_name || 'Teacher';
+        }
+      }
+
+      await supabase.from('AuditLogs').insert([
+        {
+          user_email: userEmail,
+          role: roleName,
+          action: `Updated settings and assigned cohorts for exam: "${title}"`,
+          type: 'User Activity',
+          severity: 'Info',
+          ip_address: 'Internal',
+          user_agent: navigator.userAgent
+        }
+      ]);
+    }
+
+    const newStartDateStr = scheduleStartUTC ? new Date(scheduleStartUTC).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date';
+    const newEndDateStr = scheduleEndUTC ? new Date(scheduleEndUTC).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date';
+    const mappedCohortNames = teacherCohorts.filter(c => editSelectedCohorts.includes(c.id)).map(c => c.name);
+
+    setExams(prev => prev.map(ex => ex.id === selectedExam ? {
+      ...ex,
+      title,
+      scheduleStart: rawScheduleStart,
+      scheduleEnd: rawScheduleEnd,
+      timeLimit,
+      status,
+      startDateStr: newStartDateStr,
+      endDateStr: newEndDateStr,
+      maxAttempts,
+      gradingLogic,
+      closeAfterDeadline,
+      cohortIds: editSelectedCohorts,
+      cohorts: mappedCohortNames
+    } : ex));
+    
+    addToast('Exam settings & cohorts successfully updated.', 'success');
   };
 
   const exportToCSV = () => {
@@ -550,87 +620,101 @@ function FacultyExamsContent() {
       addToast('No analytics data to export.', 'error');
       return;
     }
-    const headers = ['Student Name', 'Status', 'Date Taken', 'Grade'];
-    const rows = filteredStudents.map(s => [
-      `"${s.name}"`,
-      `"${s.status}"`,
-      `"${s.takenAt}"`,
-      `"${s.grade}"`
-    ]);
+    const headers = ['Student Name', 'Status', 'Latest Date Taken', 'Final Grade'];
+    const rows = filteredStudents.map(s => {
+      const latestAttempt = s.attempts && s.attempts.length > 0 ? s.attempts[s.attempts.length - 1] : null;
+      const dateTaken = latestAttempt?.completed_at ? new Date(latestAttempt.completed_at).toLocaleString() : 'Pending';
+      return [
+        `"${s.name}"`,
+        `"${s.status}"`,
+        `"${dateTaken}"`,
+        `"${s.grade}"`
+      ];
+    });
     const csvContent = [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    link.download = `${currentExam?.title.replace(/\s+/g, '_')}_Analytics.csv`;
+    link.download = `${currentExam?.title.replace(/\s+/g, '_')}_Gradebook.csv`;
     link.click();
   };
 
-  const handleViewAnswers = async (student: any) => {
-    if (!student.attemptId) {
-      addToast('No attempt record found for this student.', 'error');
-      return;
-    }
-
+  const handleViewStudent = async (student: any) => {
     setIsLoadingReview(true);
-    const { data: answersData, error } = await supabase
-      .from('Student Answers')
-      .select(`
-        selected_option,
-        is_correct,
-        "Mock Exam Items" ( question, correct_answer, options )
-      `)
-      .eq('attempt_id', student.attemptId);
 
-    if (error || !answersData) {
-      addToast('Failed to fetch student answers.', 'error');
+    if (!student.attempts || student.attempts.length === 0) {
+      addToast('No attempts found for this student.', 'error');
       setIsLoadingReview(false);
       return;
     }
 
-    const reviewItems: StudentReviewItem[] = answersData.map((ans: any, idx: number) => {
-      const rawMock = ans['Mock Exam Items'];
-      const mockItem = Array.isArray(rawMock) ? rawMock[0] : rawMock;
+    const formattedAttempts: AttemptRecord[] = await Promise.all(
+      student.attempts.map(async (attempt: any) => {
+        const { data: answersData } = await supabase
+          .from("Student Answers")
+          .select(`
+            selected_option,
+            is_correct,
+            rag_feedback,
+            "Mock Exam Items" ( question, correct_answer, rationale, options )
+          `)
+          .eq("attempt_id", attempt.attempt_id);
 
-      let parsedOptions: string[] = [];
-      let mappedCorrectAnswer = String(mockItem?.correct_answer || 'N/A').trim();
-
-      try {
-        let raw = mockItem?.options;
-        while (typeof raw === 'string') raw = JSON.parse(raw);
-
-        if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
-          parsedOptions = Object.values(raw).map(opt => String(opt));
-          if (raw[mappedCorrectAnswer.toUpperCase()]) {
-            mappedCorrectAnswer = String(raw[mappedCorrectAnswer.toUpperCase()]);
+        const items: StudentReviewItem[] = (answersData || []).map((ans, idx) => {
+          const rawMockItem = ans["Mock Exam Items"];
+          const mockItem = Array.isArray(rawMockItem) ? rawMockItem[0] : rawMockItem;
+          
+          let parsedOptions: string[] = [];
+          let mappedCorrectAnswer = String(mockItem?.correct_answer || "N/A").trim();
+          
+          try {
+            let raw = mockItem?.options;
+            while (typeof raw === 'string') raw = JSON.parse(raw);
+            if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+              parsedOptions = Object.values(raw).map(opt => String(opt));
+              if (raw[mappedCorrectAnswer.toUpperCase()]) mappedCorrectAnswer = String(raw[mappedCorrectAnswer.toUpperCase()]);
+            } else if (Array.isArray(raw)) {
+              parsedOptions = raw.map(opt => String(opt));
+              if (mappedCorrectAnswer.length === 1 && /^[A-Z]$/i.test(mappedCorrectAnswer)) {
+                const charIdx = mappedCorrectAnswer.toUpperCase().charCodeAt(0) - 65;
+                if (parsedOptions[charIdx]) mappedCorrectAnswer = parsedOptions[charIdx];
+              }
+            }
+          } catch (e) {
+            console.error("Failed to parse options for review", e);
           }
-        } else if (Array.isArray(raw)) {
-          parsedOptions = raw.map(opt => String(opt));
-          if (mappedCorrectAnswer.length === 1 && /^[A-Z]$/i.test(mappedCorrectAnswer)) {
-            const charIdx = mappedCorrectAnswer.toUpperCase().charCodeAt(0) - 65;
-            if (parsedOptions[charIdx]) mappedCorrectAnswer = parsedOptions[charIdx];
-          }
-        }
-      } catch (e) {
-        parsedOptions = [];
-      }
 
-      return {
-        qNum: idx + 1,
-        text: mockItem?.question || 'Question data unavailable',
-        options: parsedOptions,
-        studentAnswer: String(ans.selected_option || 'No Answer Selected').replace(/^["']|["']$/g, '').trim(),
-        correctAnswer: mappedCorrectAnswer.replace(/^["']|["']$/g, '').trim(),
-        isCorrect: ans.is_correct
-      };
-    });
+          const cleanCorrectAnswer = mappedCorrectAnswer.replace(/^["']|["']$/g, '').trim();
+          const cleanStudentAnswer = String(ans.selected_option || "No Answer Selected").replace(/^["']|["']$/g, '').trim();
+
+          return {
+            qNum: idx + 1,
+            text: mockItem?.question || "Question data unavailable",
+            studentAnswer: cleanStudentAnswer,
+            correctAnswer: cleanCorrectAnswer,
+            isCorrect: ans.is_correct,
+            explanation: mockItem?.rationale || ans.rag_feedback || "No explanation provided for this item.",
+            options: parsedOptions,
+          };
+        });
+
+        return {
+          attemptId: attempt.attempt_id,
+          score: attempt.final_score || 0,
+          rawScore: items.filter(i => i.isCorrect).length,
+          maxScore: items.length,
+          status: attempt.exam_status,
+          takenAt: attempt.completed_at,
+          items: items,
+        };
+      })
+    );
 
     setSelectedStudentForReview({
       name: student.name,
-      grade: student.grade,
-      rawScore: student.rawScore,
-      takenAt: student.takenAt,
-      items: reviewItems
+      attempts: formattedAttempts
     });
+    setActiveAttemptIndex(formattedAttempts.length > 0 ? formattedAttempts.length - 1 : 0);
     setIsLoadingReview(false);
   };
 
@@ -660,7 +744,6 @@ function FacultyExamsContent() {
     return 'Approved';
   };
 
-  // --- Maintenance Mode Action Protector ---
   const executeProtectedAction = (action: () => void) => {
     if (isMaintenanceMode && !hasAcknowledgedVoidWarning) {
       setPendingMaintenanceAction(() => action);
@@ -670,7 +753,6 @@ function FacultyExamsContent() {
     }
   };
 
-  // --- Validation Actions ---
   const toggleQuestionSelection = (id: string) => {
     setSelectedQuestions(prev => prev.includes(id) ? prev.filter(qId => qId !== id) : [...prev, id]);
   };
@@ -835,7 +917,6 @@ function FacultyExamsContent() {
     addToast('Vault question loaded successfully.', 'success');
   };
 
-  // --- Filtering & Pagination ---
   const filteredExams = exams.filter(exam => {
     const matchesSearch = exam.title.toLowerCase().includes(debouncedExamSearch.toLowerCase()) || exam.target.toLowerCase().includes(debouncedExamSearch.toLowerCase());
     const matchesStatus = examStatusFilter === 'All' || exam.status === examStatusFilter;
@@ -859,8 +940,6 @@ function FacultyExamsContent() {
     setStudentStatusFilter(e.target.value);
     resetPage();
   };
-
-  // --- RENDERERS ---
   if (selectedExam !== null && currentExam) {
     return (
       <div className="space-y-6 relative pb-24">
@@ -889,11 +968,11 @@ function FacultyExamsContent() {
           )}
 
           <button
-            onClick={() => { if (!isValidationMode) { setExamTab('analytics'); resetPage(); setSelectedStudentForReview(null); } }}
-            className={`pb-4 border-b-2 text-sm font-bold flex items-center gap-2 whitespace-nowrap ${examTab === 'analytics' ? 'border-blue-400 text-white' : 'border-transparent text-slate-400 hover:text-slate-200'} ${isValidationMode ? 'opacity-50 cursor-not-allowed' : ''}`}
+            onClick={() => { if (!isValidationMode) { setExamTab('gradebook'); resetPage(); setSelectedStudentForReview(null); } }}
+            className={`pb-4 border-b-2 text-sm font-bold flex items-center gap-2 whitespace-nowrap ${examTab === 'gradebook' ? 'border-blue-400 text-white' : 'border-transparent text-slate-400 hover:text-slate-200'} ${isValidationMode ? 'opacity-50 cursor-not-allowed' : ''}`}
           >
             {isValidationMode && <span>🔒</span>}
-            Student Analytics
+            Gradebook
           </button>
         </div>
 
@@ -914,6 +993,71 @@ function FacultyExamsContent() {
                    <div>
                      <label className="block text-sm font-bold text-slate-700 mb-2">Target Subject</label>
                      <input type="text" defaultValue={currentExam.target} disabled className="w-full px-4 py-3 border border-slate-200 bg-slate-50 rounded-lg text-sm font-bold text-slate-500 cursor-not-allowed" />
+                   </div>
+                 </div>
+
+                 <div className="grid grid-cols-1 gap-6">
+                   <div className="relative md:col-span-2">
+                     <label className="block text-sm font-bold text-slate-700 mb-2">Target Cohort(s)</label>
+                     <div 
+                       onClick={() => setIsCohortDropdownOpen(!isCohortDropdownOpen)}
+                       className="min-h-[46px] w-full px-3 py-2 border rounded-lg flex flex-wrap gap-2 items-center cursor-pointer bg-white transition-colors border-slate-300 hover:border-blue-400"
+                     >
+                       {editSelectedCohorts.length === 0 ? (
+                         <span className="text-sm font-bold text-slate-400 px-1">Select assigned cohorts...</span>
+                       ) : (
+                         editSelectedCohorts.map(id => {
+                           const cohort = teacherCohorts.find(c => c.id === id);
+                           return (
+                             <span key={id} className="flex items-center gap-1.5 px-2.5 py-1 bg-blue-50 border border-blue-200 text-blue-900 text-xs font-bold rounded-md z-10">
+                               {cohort?.name || 'Unknown Cohort'}
+                               <button 
+                                 type="button" 
+                                 onClick={(e) => { 
+                                   e.stopPropagation(); 
+                                   setEditSelectedCohorts(prev => prev.filter(cId => cId !== id)); 
+                                 }}
+                                 className="text-blue-500 hover:text-blue-800 bg-white rounded-full p-0.5 transition-colors"
+                               >
+                                 <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                               </button>
+                             </span>
+                           );
+                         })
+                       )}
+                       <div className="ml-auto px-1">
+                         <svg className={`w-4 h-4 text-slate-400 transition-transform duration-200 ${isCohortDropdownOpen ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                       </div>
+                     </div>
+
+                     {isCohortDropdownOpen && (
+                       <>
+                         <div className="fixed inset-0 z-10" onClick={() => setIsCohortDropdownOpen(false)}></div>
+                         <div className="absolute z-20 w-full mt-2 bg-white border border-slate-200 rounded-lg shadow-xl max-h-60 overflow-auto py-1 animate-in fade-in slide-in-from-top-2">
+                           {teacherCohorts.length === 0 ? (
+                             <div className="p-4 text-sm text-slate-500 font-bold text-center">No active cohorts assigned to you.</div>
+                           ) : (
+                             teacherCohorts.map(c => {
+                               const isSelected = editSelectedCohorts.includes(c.id);
+                               return (
+                                 <div 
+                                   key={c.id} 
+                                   onClick={() => {
+                                     setEditSelectedCohorts(prev => prev.includes(c.id) ? prev.filter(id => id !== c.id) : [...prev, c.id]);
+                                   }}
+                                   className={`flex items-center gap-3 px-4 py-3 cursor-pointer transition-colors ${isSelected ? 'bg-blue-50' : 'hover:bg-slate-50'}`}
+                                 >
+                                   <div className={`w-4 h-4 rounded border flex items-center justify-center transition-colors ${isSelected ? 'bg-blue-600 border-blue-600 text-white' : 'border-slate-300 bg-white'}`}>
+                                     {isSelected && <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" /></svg>}
+                                   </div>
+                                   <span className={`text-sm font-bold ${isSelected ? 'text-blue-900' : 'text-slate-700'}`}>{c.name}</span>
+                                 </div>
+                               );
+                             })
+                           )}
+                         </div>
+                       </>
+                     )}
                    </div>
                  </div>
 
@@ -940,7 +1084,6 @@ function FacultyExamsContent() {
                    </div>
                  </div>
 
-                 {/* NEW EXAM SETTINGS */}
                  <div className="grid grid-cols-1 md:grid-cols-3 gap-6 pt-6 border-t border-slate-100">
                    <div>
                      <label className="block text-sm font-bold text-slate-700 mb-2">Max Attempts Allowed</label>
@@ -1052,30 +1195,29 @@ function FacultyExamsContent() {
                           </div>
                         )}
 
-                        <div className="flex justify-between items-start mb-5 pb-4 border-b border-slate-100">
-                          <div className="flex items-center gap-3">
+                        <div className="flex flex-col md:flex-row justify-between items-start mb-5 pb-4 border-b border-slate-100 gap-4">
+                          <div className="flex items-start gap-3 w-full">
                             {isValidationMode && validationTab === 'pending' && (
                               <input
                                 type="checkbox"
                                 checked={selectedQuestions.includes(q.id)}
                                 onChange={() => toggleQuestionSelection(q.id)}
-                                className="h-5 w-5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+                                className="mt-1 h-5 w-5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
                               />
                             )}
-                            <span className="w-8 h-8 rounded-full bg-slate-100 text-slate-600 flex items-center justify-center text-sm font-bold border border-slate-200">
+                            <span className="w-8 h-8 shrink-0 mt-0.5 rounded-full bg-slate-100 text-slate-600 flex items-center justify-center text-sm font-bold border border-slate-200">
                               {index + 1}
                             </span>
-                            <span className="text-sm font-bold text-slate-900">{q.topic}</span>
+                            <p className="text-base font-bold text-slate-900 leading-relaxed pt-1 w-full pr-4">{q.question}</p>
                           </div>
                           {isValidationMode && (
-                            <span className={`px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider border ${getAIStatusStyle(q.status)} border-current`}>
+                            <span className={`shrink-0 px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider border ${getAIStatusStyle(q.status)} border-current`}>
                               {getAIStatusLabel(q.status)}
                             </span>
                           )}
                         </div>
 
                         <div className="mb-6 md:ml-11">
-                          <p className="text-sm font-bold text-slate-900 mb-4">{q.question}</p>
                           <div className="space-y-3 mb-6">
                             {q.options.map((opt, idx) => (
                               <div key={idx} className={`p-4 border rounded-lg text-sm font-bold ${normalizeForComparison(opt) === normalizeForComparison(q.answer) ? 'bg-emerald-50 border-emerald-200 text-emerald-900' : 'bg-white border-slate-200 text-slate-600'}`}>
@@ -1086,14 +1228,19 @@ function FacultyExamsContent() {
                             ))}
                           </div>
 
-                          <div className="bg-slate-50 border border-slate-200 p-4 rounded-lg flex flex-col gap-1 mb-3">
-                            <span className="text-sm font-bold text-slate-900">Rationale</span>
-                            <p className="text-sm font-bold text-slate-900 leading-relaxed">{q.rationale}</p>
-                          </div>
-
-                          <div className="bg-slate-50 border border-slate-200 p-4 rounded-lg flex flex-col gap-1">
-                            <span className="text-sm font-bold text-slate-900">Sources:</span>
-                            <p className="text-sm font-bold text-slate-900 leading-relaxed">{q.citation}</p>
+                          <div className="grid grid-cols-1 gap-3 mt-6">
+                            <div className="bg-slate-50 border border-slate-200 p-4 rounded-lg flex flex-col gap-1">
+                              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Target Competency / Topic</span>
+                              <p className="text-sm font-bold text-slate-900">{q.topic}</p>
+                            </div>
+                            <div className="bg-slate-50 border border-slate-200 p-4 rounded-lg flex flex-col gap-1">
+                              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Rationale</span>
+                              <p className="text-sm font-bold text-slate-900 leading-relaxed">{q.rationale}</p>
+                            </div>
+                            <div className="bg-slate-50 border border-slate-200 p-4 rounded-lg flex flex-col gap-1">
+                              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Sources</span>
+                              <p className="text-sm font-bold text-slate-900 leading-relaxed">{q.citation}</p>
+                            </div>
                           </div>
                         </div>
 
@@ -1109,7 +1256,7 @@ function FacultyExamsContent() {
                                 </button>
                                 <div className="ml-auto flex gap-3">
                                   <button onClick={() => handlePullFromVault(q)} className="px-5 py-2.5 border border-indigo-200 text-indigo-700 text-xs font-bold rounded-lg hover:bg-indigo-50 transition-colors shadow-sm flex items-center gap-1.5">
-                                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                                    <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
                                     Pull from Vault
                                   </button>
                                   <button onClick={() => confirmRegeneration(q.id)} className="px-5 py-2.5 bg-purple-100 text-purple-800 text-xs font-bold rounded-lg hover:bg-purple-200 transition-colors shadow-sm flex items-center gap-1.5">
@@ -1124,7 +1271,7 @@ function FacultyExamsContent() {
                                   Edit Manually
                                 </button>
                                 <button onClick={() => executeProtectedAction(() => handlePullFromVault(q))} className="px-5 py-2.5 border border-indigo-200 text-indigo-700 text-xs font-bold rounded-lg hover:bg-indigo-50 transition-colors shadow-sm flex items-center gap-1.5">
-                                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
                                   Pull from Vault
                                 </button>
                                 <button onClick={() => executeProtectedAction(() => confirmRegeneration(q.id))} className="px-5 py-2.5 bg-purple-100 text-purple-800 text-xs font-bold rounded-lg hover:bg-purple-200 transition-colors shadow-sm flex items-center gap-1.5">
@@ -1142,9 +1289,8 @@ function FacultyExamsContent() {
               </div>
             </div>
           )}
-
-          {/* STUDENT ANALYTICS TAB */}
-          {examTab === 'analytics' && (
+          {/* GRADEBOOK TAB (Formerly Student Analytics) */}
+          {examTab === 'gradebook' && (
             <div>
               {isLoadingReview ? (
                 <div className="p-16 text-center text-slate-500 font-bold flex flex-col items-center justify-center gap-3">
@@ -1158,26 +1304,73 @@ function FacultyExamsContent() {
                       onClick={() => setSelectedStudentForReview(null)}
                       className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-lg transition-colors flex items-center gap-2"
                     >
-                      ← Back to Student List
+                      ← Back to Gradebook
                     </button>
                     <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">
                       Student Assessment Review
                     </span>
                   </div>
 
-                  <div className="bg-slate-50 p-6 rounded-xl border border-slate-200 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                  <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
                     <div>
                       <h3 className="text-xl font-bold text-slate-800">{selectedStudentForReview.name}</h3>
-                      <p className="text-xs text-slate-500 font-bold mt-1">Submitted on {selectedStudentForReview.takenAt}</p>
+                      <p className="text-xs text-slate-500 font-bold mt-1">
+                        Viewing Attempt {activeAttemptIndex + 1} of {selectedStudentForReview.attempts.length} — Submitted on {formatAttemptDate(selectedStudentForReview.attempts[activeAttemptIndex].takenAt)}
+                      </p>
                     </div>
-                    <div className="bg-white border border-slate-200 px-6 py-3 rounded-lg text-center shadow-sm">
-                      <span className="text-3xl font-black text-blue-600 block">{selectedStudentForReview.grade}</span>
-                      <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">Score Achieved</span>
+
+                    <div className="flex flex-col sm:flex-row items-center gap-4 w-full md:w-auto">
+                      <div className="relative min-w-[280px]">
+                        <button
+                          onClick={() => setIsReviewDropdownOpen(!isReviewDropdownOpen)}
+                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-bold text-slate-800 bg-white flex justify-between items-center transition-colors hover:border-blue-400 focus:outline-none focus:ring-1 focus:ring-blue-500 shadow-sm"
+                        >
+                          <span className="uppercase text-xs tracking-wider">
+                            ATTEMPT {activeAttemptIndex + 1}/{selectedStudentForReview.attempts.length} (SUBMITTED {formatAttemptDate(selectedStudentForReview.attempts[activeAttemptIndex].takenAt).toUpperCase()})
+                          </span>
+                          <svg className={`w-4 h-4 ml-2 transition-transform duration-200 text-slate-500 ${isReviewDropdownOpen ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                          </svg>
+                        </button>
+                        
+                        {isReviewDropdownOpen && (
+                          <>
+                            <div className="fixed inset-0 z-10" onClick={() => setIsReviewDropdownOpen(false)}></div>
+                            <div className="absolute z-20 w-full mt-1 bg-white border border-slate-200 rounded-lg shadow-xl overflow-hidden py-1.5 animate-in fade-in slide-in-from-top-2">
+                              {selectedStudentForReview.attempts.map((att, idx) => {
+                                const isSelected = activeAttemptIndex === idx;
+                                return (
+                                  <div 
+                                    key={idx}
+                                    onClick={() => { setActiveAttemptIndex(idx); setIsReviewDropdownOpen(false); }}
+                                    className={`flex justify-between items-center px-4 py-3 cursor-pointer transition-colors border-l-4 ${isSelected ? 'bg-blue-50 border-blue-600' : 'hover:bg-slate-50 border-transparent'}`}
+                                  >
+                                    <div>
+                                      <div className={`text-sm font-bold ${isSelected ? 'text-blue-900' : 'text-slate-800'}`}>Attempt {idx + 1}</div>
+                                      <div className={`text-xs font-bold mt-0.5 ${isSelected ? 'text-blue-600' : 'text-slate-500'}`}>Submitted {formatAttemptDate(att.takenAt)}</div>
+                                    </div>
+                                    <div className={`px-2.5 py-1 rounded text-xs font-bold shrink-0 border ${isSelected ? 'bg-emerald-500 border-emerald-600 text-white' : 'bg-emerald-100 border-emerald-200 text-emerald-800'}`}>
+                                      {att.rawScore} / {att.maxScore}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                      
+                      <div className="bg-slate-50 border border-slate-200 px-4 py-2 rounded-lg text-center min-w-[120px]">
+                        <span className="text-2xl font-black text-blue-600 block leading-none">
+                          {selectedStudentForReview.attempts[activeAttemptIndex].rawScore} / {selectedStudentForReview.attempts[activeAttemptIndex].maxScore}
+                        </span>
+                        <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider mt-1 block">Attempt Score</span>
+                      </div>
                     </div>
                   </div>
 
                   <div className="grid gap-6">
-                    {selectedStudentForReview.items.map((item) => (
+                    {selectedStudentForReview.attempts[activeAttemptIndex].items.map((item) => (
                       <div
                         key={item.qNum}
                         className={`p-6 border rounded-xl bg-white shadow-sm flex flex-col gap-3 border-l-4 transition-all ${
@@ -1223,6 +1416,18 @@ function FacultyExamsContent() {
                             );
                           })}
                         </div>
+                        
+                        <div className="bg-blue-50/50 border border-blue-100 p-4 rounded-lg mt-3 flex items-start gap-3">
+                          <span className="text-lg shrink-0 mt-0.5">🧠</span>
+                          <div>
+                            <span className="block text-[11px] font-bold text-blue-800 uppercase tracking-wider mb-1">
+                              AI-Generated Rationale
+                            </span>
+                            <p className="text-sm text-blue-950 font-bold leading-relaxed">
+                              {item.explanation}
+                            </p>
+                          </div>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -1231,12 +1436,12 @@ function FacultyExamsContent() {
                 <div>
                   <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
                     <div>
-                      <h2 className="text-xl font-bold text-slate-800">Student Analytics</h2>
-                      <p className="text-sm text-slate-500 font-bold mt-1">Review student progress and completion grades for this assessment.</p>
+                      <h2 className="text-xl font-bold text-slate-800">Gradebook & Analytics</h2>
+                      <p className="text-sm text-slate-500 font-bold mt-1">Review student progress, completion grades, and specific attempts.</p>
                     </div>
                     <button onClick={exportToCSV} className="px-4 py-2 border border-slate-300 text-slate-900 text-xs font-bold rounded-lg hover:bg-slate-50 transition-colors shadow-sm flex items-center gap-2">
                       <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                      Export to CSV
+                      Export Gradebook CSV
                     </button>
                   </div>
 
@@ -1266,16 +1471,15 @@ function FacultyExamsContent() {
                         <tr className="bg-slate-50 border-b border-slate-200">
                           <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500">Student Name</th>
                           <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500">Status</th>
-                          <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500">Date and Time Taken</th>
-                          <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500">Grade</th>
-                          <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500 text-right">Action</th>
+                          <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500">Final Grade</th>
+                          <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500 text-right">Attempt Logs</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100 text-sm">
                         {isFetchingAnalytics ? (
-                          <tr><td colSpan={5} className="p-8 text-center text-sm font-bold text-slate-500">Loading analytics...</td></tr>
+                          <tr><td colSpan={4} className="p-8 text-center text-sm font-bold text-slate-500">Loading gradebook...</td></tr>
                         ) : currentStudents.length === 0 ? (
-                          <tr><td colSpan={5} className="p-8 text-center text-sm font-bold text-slate-500">No students match your filter criteria.</td></tr>
+                          <tr><td colSpan={4} className="p-8 text-center text-sm font-bold text-slate-500">No students match your filter criteria.</td></tr>
                         ) : (
                           currentStudents.map(student => (
                             <tr key={student.id} className="hover:bg-slate-50 transition-colors bg-white">
@@ -1285,16 +1489,18 @@ function FacultyExamsContent() {
                                   {student.status}
                                 </span>
                               </td>
-                              <td className="p-4 font-bold text-slate-500">{student.takenAt}</td>
                               <td className="p-4 font-bold text-slate-700">{student.grade}</td>
-                              <td className="p-4 text-right flex gap-3 justify-end">
-                                <button
-                                  onClick={() => handleViewAnswers(student)}
-                                  disabled={student.status !== 'Completed' || !student.attemptId}
-                                  className={`text-xs font-bold ${student.status === 'Completed' && student.attemptId ? 'text-blue-600 hover:underline cursor-pointer' : 'text-slate-400 cursor-not-allowed'}`}
-                                >
-                                  View Answers
-                                </button>
+                              <td className="p-4 text-right flex gap-2 justify-end flex-wrap">
+                                {student.attempts && student.attempts.length > 0 ? (
+                                  <button
+                                    onClick={() => handleViewStudent(student)}
+                                    className="text-xs font-bold text-blue-600 hover:underline cursor-pointer"
+                                  >
+                                    View Attempts ({student.attempts.length})
+                                  </button>
+                                ) : (
+                                  <span className="text-xs font-bold text-slate-400">No Attempts</span>
+                                )}
                               </td>
                             </tr>
                           ))

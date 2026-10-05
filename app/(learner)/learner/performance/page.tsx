@@ -22,25 +22,54 @@ export default function UnifiedPerformancePage() {
 
       const now = new Date();
 
-      // 1. Fetch ALL visible exams (to know what was required)
-      const { data: allExams, error: examsError } = await supabase
-        .from('Exams')
-        .select('exam_id, exam_title, exam_subject, schedule_start, schedule_end, close_after_deadline, global_status, grading_logic')
-        .neq('global_status', 'Hidden');
+      // 1. Fetch the student's cohort
+      const { data: userData } = await supabase.from('Users').select('cohort_id').eq('user_id', user.id).single();
+      const studentCohortId = userData?.cohort_id;
 
-      // 2. Fetch ONLY the current student's completed attempts
+      // 2. Fetch ONLY the current student's completed attempts WITH their exact answers
       const { data: attempts, error: attemptsError } = await supabase
         .from('Student Attempts')
-        .select('attempt_id, final_score, completed_at, exam_id')
+        .select(`
+          attempt_id, 
+          final_score, 
+          completed_at, 
+          exam_id,
+          "Student Answers" (is_correct)
+        `)
         .eq('student_id', user.id)
         .eq('exam_status', 'completed')
         .order('completed_at', { ascending: false });
 
-      if (examsError) {
+      if (attemptsError) {
         setIsLoading(false);
         setCohortRank("N/A");
         return;
       }
+
+      const attemptedExamIds = attempts?.map(a => a.exam_id) || [];
+
+      // 3. Fetch exams assigned to their current cohort
+      let cohortExamIds: string[] = [];
+      if (studentCohortId) {
+        const { data: cohortExams } = await supabase.from('Exam_Cohorts').select('exam_id').eq('cohort_id', studentCohortId);
+        cohortExamIds = cohortExams?.map(ce => ce.exam_id) || [];
+      }
+
+      // 4. MERGE: Combine exams they took historically + exams currently assigned to them
+      const relevantExamIds = [...new Set([...attemptedExamIds, ...cohortExamIds])];
+
+      if (relevantExamIds.length === 0) {
+        setIsLoading(false);
+        setCohortRank("N/A");
+        return;
+      }
+
+      // 5. Fetch ONLY relevant exams with dynamic passing metrics
+      const { data: allExams } = await supabase
+        .from('Exams')
+        .select('exam_id, exam_title, exam_subject, schedule_start, schedule_end, close_after_deadline, global_status, grading_logic, passing_score, passing_percentage')
+        .in('exam_id', relevantExamIds)
+        .neq('global_status', 'Hidden');
 
       // Group student's attempts by exam_id
       const groupedAttempts: Record<string, any[]> = {};
@@ -51,15 +80,17 @@ export default function UnifiedPerformancePage() {
         });
       }
 
-      // 3. Build the consolidated history (including missed exams)
+      // 6. Build the consolidated history
       const consolidatedHistory: any[] = [];
-      const requiredExams = (allExams || []).filter(e => e.schedule_end && e.close_after_deadline && now > new Date(e.schedule_end));
+      const requiredExams = (allExams || []).filter(e => 
+        cohortExamIds.includes(e.exam_id) && e.schedule_end && e.close_after_deadline && now > new Date(e.schedule_end)
+      );
 
       (allExams || []).forEach(exam => {
         const group = groupedAttempts[exam.exam_id];
+        const targetScore = exam.passing_percentage || exam.passing_score || 75;
 
         if (group && group.length > 0) {
-          // They took the exam, calculate it based on grading logic
           const latestAttempt = group[0]; 
           const logic = exam.grading_logic || 'highest';
 
@@ -70,8 +101,19 @@ export default function UnifiedPerformancePage() {
             const sum = group.reduce((acc, a) => acc + (a.final_score || 0), 0);
             finalCalculatedScore = Math.round(sum / group.length);
           } else {
-            finalCalculatedScore = latestAttempt.final_score || 0; // 'latest'
+            finalCalculatedScore = latestAttempt.final_score || 0; 
           }
+
+          // Dynamically calculate exact correct/incorrect from the answers array
+          let correctCount = 0;
+          let totalItems = 100;
+          if (latestAttempt["Student Answers"] && latestAttempt["Student Answers"].length > 0) {
+            totalItems = latestAttempt["Student Answers"].length;
+            correctCount = latestAttempt["Student Answers"].filter((a: any) => a.is_correct).length;
+          } else {
+            correctCount = Math.round((finalCalculatedScore / 100) * totalItems);
+          }
+          const incorrectCount = totalItems - correctCount;
 
           const dateObj = new Date(latestAttempt.completed_at || Date.now());
           
@@ -83,14 +125,14 @@ export default function UnifiedPerformancePage() {
             score: `${finalCalculatedScore}%`,
             rawScore: finalCalculatedScore,
             date: dateObj.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }),
-            status: finalCalculatedScore >= 75 ? 'Passed' : 'Needs Review',
+            status: finalCalculatedScore >= targetScore ? 'Passed' : 'Needs Review',
             attemptsCount: group.length,
-            gradingLogic: logic
+            gradingLogic: logic,
+            targetScore,
+            itemStats: { correct: correctCount, incorrect: incorrectCount, total: totalItems }
           });
         } else {
-          // They did NOT take it - check if it's considered "Missed"
           const isRequiredAndMissed = requiredExams.some(re => re.exam_id === exam.exam_id);
-          
           if (isRequiredAndMissed) {
             const examEndDate = new Date(exam.schedule_end);
             consolidatedHistory.push({
@@ -99,17 +141,18 @@ export default function UnifiedPerformancePage() {
               name: exam.exam_title || 'Unknown Exam',
               subject: exam.exam_subject || 'General Assessment',
               score: '0%',
-              rawScore: 0, // Zero score actively ruins their average
+              rawScore: 0, 
               date: examEndDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }),
               status: 'Missed',
               attemptsCount: 0,
-              gradingLogic: exam.grading_logic || 'highest'
+              gradingLogic: exam.grading_logic || 'highest',
+              targetScore: targetScore,
+              itemStats: { correct: 0, incorrect: 0, total: 0 }
             });
           }
         }
       });
 
-      // Sort consolidated history by date descending
       consolidatedHistory.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
       if (consolidatedHistory.length === 0) {
@@ -118,11 +161,11 @@ export default function UnifiedPerformancePage() {
         return;
       }
 
-      // 4. Calculate Top-Level Stats (Now factoring in the 0s)
+      // 7. Calculate Top-Level Stats
       const totalScore = consolidatedHistory.reduce((acc, curr) => acc + (curr.rawScore || 0), 0);
       const avg = Math.round(totalScore / consolidatedHistory.length);
 
-      // 5. Dynamically build Radar Chart (Now tracking missed subjects as 0)
+      // 8. Dynamically build Radar Chart
       const subjectAverages: Record<string, { total: number; count: number }> = {};
       consolidatedHistory.forEach((h) => {
         if (!subjectAverages[h.subject]) subjectAverages[h.subject] = { total: 0, count: 0 };
@@ -130,11 +173,21 @@ export default function UnifiedPerformancePage() {
         subjectAverages[h.subject].count += 1;
       });
 
+      // ---> NEW: Removed the text truncation so full subjects display correctly
       const dynamicRadarData = Object.keys(subjectAverages).map(subj => ({
-        subject: subj.length > 12 ? subj.substring(0, 12) + '...' : subj,
+        subject: subj, 
         score: Math.round(subjectAverages[subj].total / subjectAverages[subj].count),
         fullMark: 100
       }));
+
+      // Find the student's best and worst subject for dynamic feedback
+      let bestSubject = { name: 'General', score: -1 };
+      let worstSubject = { name: 'General', score: 101 };
+      
+      dynamicRadarData.forEach(d => {
+        if (d.score > bestSubject.score) bestSubject = { name: d.subject, score: d.score };
+        if (d.score < worstSubject.score) worstSubject = { name: d.subject, score: d.score };
+      });
 
       if (dynamicRadarData.length === 1) {
         dynamicRadarData.push({ subject: 'Logic', score: avg, fullMark: 100 }, { subject: 'Retention', score: avg, fullMark: 100 });
@@ -142,34 +195,36 @@ export default function UnifiedPerformancePage() {
         dynamicRadarData.push({ subject: 'Retention', score: avg, fullMark: 100 });
       }
 
-      // 6. Dynamic AI Feedback
+      const mostRecent = consolidatedHistory[0];
+
+      // 9. Dynamic AI Feedback utilizing the Radar and Passing Thresholds
       let dynamicFeedback = "";
       if (avg >= 90) {
-        dynamicFeedback = "Outstanding performance! Your historical data indicates a mastery of the core competencies. Keep up the excellent retention strategies.";
-      } else if (avg >= 75) {
-        dynamicFeedback = "Solid performance. You have a good grasp of most concepts, but targeted review in your lower-scoring subjects will push you to mastery.";
+        dynamicFeedback = `Outstanding performance! Your historical average of ${avg}% shows deep mastery. You are particularly strong in ${bestSubject.name}. Keep up the excellent retention strategies.`;
+      } else if (avg >= mostRecent.targetScore) {
+        dynamicFeedback = `Solid performance with an average of ${avg}%. You have a good grasp of most concepts, but targeted review in ${worstSubject.name} will push you to full mastery.`;
       } else {
-        dynamicFeedback = "Your performance indicates some fundamental gaps. Missing exams or scoring low means it is highly recommended to review the core study materials and retake diagnostic exams.";
+        dynamicFeedback = `Your performance indicates some fundamental gaps. Falling below the passing threshold of ${mostRecent.targetScore}% means it is highly recommended to review the core study materials for ${worstSubject.name}.`;
       }
 
-      const mostRecent = consolidatedHistory[0];
+      const dynamicActionPlan = `Based on your overall metrics, your priority should be reviewing reference materials related to ${worstSubject.name} before attempting another simulation.`;
 
       setHistoricalAttempts(consolidatedHistory);
       setStats({ completed: consolidatedHistory.length, average: avg });
       setLatestExam({
         examName: mostRecent.name,
         completionDate: mostRecent.date,
-        scoreBreakdown: { correct: mostRecent.rawScore, incorrect: 100 - mostRecent.rawScore, total: 100 },
+        scoreBreakdown: mostRecent.itemStats,
         aiRagFeedback: dynamicFeedback,
+        actionPlan: dynamicActionPlan,
         radarData: dynamicRadarData
       });
 
-      // 7. Calculate Cohort Standing securely applying grading logic AND penalizing the cohort for their missed exams too
+      // 10. Calculate Cohort Standing securely applying grading logic
       let calculatedRank = "N/A";
-      const { data: userData } = await supabase.from('Users').select('cohort_id').eq('user_id', user.id).single();
       
-      if (userData?.cohort_id) {
-        const { data: cohortUsers } = await supabase.from('Users').select('user_id').eq('cohort_id', userData.cohort_id);
+      if (studentCohortId) {
+        const { data: cohortUsers } = await supabase.from('Users').select('user_id').eq('cohort_id', studentCohortId);
         const cohortUserIds = cohortUsers?.map(u => u.user_id) || [];
 
         if (cohortUserIds.length > 0) {
@@ -181,11 +236,9 @@ export default function UnifiedPerformancePage() {
             .neq('exam.global_status', 'Hidden')
             .order('completed_at', { ascending: false });
 
-          // Initialize all students in the cohort so they don't escape zeroes
           const studentAverages: Record<string, { total: number; count: number }> = {};
           cohortUserIds.forEach(id => studentAverages[id] = { total: 0, count: 0 });
 
-          // Group existing attempts
           const studentExamGroups: Record<string, Record<string, any[]>> = {};
           if (cohortAttempts) {
             cohortAttempts.forEach(ca => {
@@ -195,7 +248,6 @@ export default function UnifiedPerformancePage() {
             });
           }
 
-          // Calculate scores based on grading logic
           Object.keys(studentExamGroups).forEach(studentId => {
             const examsForStudent = studentExamGroups[studentId];
             Object.keys(examsForStudent).forEach(examId => {
@@ -207,14 +259,13 @@ export default function UnifiedPerformancePage() {
               else if (logic === 'average') {
                 const sum = attemptsForExam.reduce((s, a) => s + (a.final_score || 0), 0);
                 score = sum / attemptsForExam.length;
-              } else score = attemptsForExam[0].final_score || 0; // 'latest'
+              } else score = attemptsForExam[0].final_score || 0; 
 
               studentAverages[studentId].total += score;
               studentAverages[studentId].count += 1;
             });
           });
 
-          // Enforce zeroes for missed exams across the whole cohort
           cohortUserIds.forEach(studentId => {
             const examsForStudent = studentExamGroups[studentId] || {};
             requiredExams.forEach(reqExam => {
@@ -297,7 +348,9 @@ export default function UnifiedPerformancePage() {
                     <p className="text-sm text-slate-400 mt-1 font-bold">Attempt evaluated on {latestExam?.completionDate}</p>
                   </div>
                   <div className="text-left md:text-right bg-slate-50 p-4 rounded-lg min-w-[140px]">
-                    <span className="text-3xl font-black text-emerald-600">{latestExam?.scoreBreakdown?.correct}%</span>
+                    <span className="text-3xl font-black text-emerald-600">
+                      {Math.round((latestExam?.scoreBreakdown?.correct / latestExam?.scoreBreakdown?.total) * 100) || 0}%
+                    </span>
                     <p className="text-xs font-bold text-slate-500 mt-1">{latestExam?.scoreBreakdown?.correct} correct out of {latestExam?.scoreBreakdown?.total}</p>
                   </div>
                 </div>
@@ -329,7 +382,9 @@ export default function UnifiedPerformancePage() {
 
                 <div className="bg-amber-50 border border-amber-100 p-8 rounded-xl">
                   <h4 className="text-base font-bold text-amber-800 mb-2">Action Plan</h4>
-                  <p className="text-sm text-amber-900 leading-relaxed mb-6 font-bold">Based on your summary, prioritize targeted resources before taking another simulation.</p>
+                  <p className="text-sm text-amber-900 leading-relaxed mb-6 font-bold">
+                    {latestExam?.actionPlan}
+                  </p>
                   <button 
                     onClick={() => router.push('/learner/exams')}
                     className="w-full py-3 bg-amber-600 hover:bg-amber-700 text-white text-sm font-bold rounded-lg transition-colors shadow-sm"

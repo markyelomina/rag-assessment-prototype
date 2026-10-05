@@ -12,6 +12,13 @@ interface Question {
   correctAnswer: string;
 }
 
+// Intercepts strings from the DB to forcefully strip hidden quotes and spaces
+const cleanString = (str: any) => {
+  return String(str || '')
+    .replace(/^[\\"'“”\[\]]+|[\\"'“”\[\]]+$/g, '')
+    .trim();
+};
+
 export default function LearnerActiveExamPage() {
   const router = useRouter();
   const params = useParams();
@@ -28,10 +35,8 @@ export default function LearnerActiveExamPage() {
   const [timeLeft, setTimeLeft] = useState(0);
   const [questions, setQuestions] = useState<Question[]>([]);
   
-  // New state to hold the start time for the database
   const [examStartTime, setExamStartTime] = useState<string>('');
 
-  // 1. Fetch Exam Details, Validate Access, and Initialize Timers
   useEffect(() => {
     const fetchExamAndQuestions = async () => {
       const examId = params?.id as string; 
@@ -44,7 +49,6 @@ export default function LearnerActiveExamPage() {
         return;
       }
 
-      // Step A: Fetch Exam Configurations
       const { data: exam, error: examError } = await supabase
         .from('Exams')
         .select('exam_title, time_limit_mins, global_status, schedule_end, close_after_deadline, max_attempts')
@@ -58,14 +62,12 @@ export default function LearnerActiveExamPage() {
         return;
       }
 
-      // Strict Access Control 1: Is the exam active?
       if (exam.global_status !== 'Active') {
         addToast("This exam is currently unavailable.", "error");
         router.push('/learner/exams');
         return;
       }
 
-      // Strict Access Control 2: Has the deadline passed?
       if (exam.close_after_deadline && exam.schedule_end) {
         const deadline = new Date(exam.schedule_end).getTime();
         if (Date.now() > deadline) {
@@ -75,7 +77,6 @@ export default function LearnerActiveExamPage() {
         }
       }
 
-      // Strict Access Control 3: Has the student exceeded max attempts?
       const { count: attemptCount, error: countError } = await supabase
         .from('Student Attempts')
         .select('attempt_id', { count: 'exact', head: true })
@@ -90,7 +91,6 @@ export default function LearnerActiveExamPage() {
 
       setExamTitle(exam.exam_title);
 
-      // Step B: Load Questions
       const { data: dbQuestions, error: qError } = await supabase
         .from('Mock Exam Items')
         .select('id, question, options, correct_answer')
@@ -104,20 +104,36 @@ export default function LearnerActiveExamPage() {
 
       const formattedQuestions: Question[] = dbQuestions.map((q: any) => {
         let parsedOptions: string[] = [];
+        let mappedAnswer = cleanString(q.correct_answer);
+
         try {
           let raw = q.options;
           while (typeof raw === 'string') {
             raw = JSON.parse(raw);
           }
           if (Array.isArray(raw)) {
-            parsedOptions = raw.map(opt => String(opt));
+            parsedOptions = raw.map(opt => cleanString(opt));
+            
+            if (mappedAnswer.length === 1 && /^[A-Z]$/i.test(mappedAnswer)) {
+              const charIdx = mappedAnswer.toUpperCase().charCodeAt(0) - 65;
+              if (parsedOptions[charIdx]) mappedAnswer = parsedOptions[charIdx];
+            }
           } else if (typeof raw === 'object' && raw !== null) {
-            parsedOptions = Object.values(raw).map(opt => String(opt));
-          } else {
-            console.warn(`Unrecognized options format for Question ${q.id}:`, q.options);
+            const keys = ['A', 'B', 'C', 'D', 'E'];
+            parsedOptions = keys
+              .map(k => raw[k] || raw[k.toLowerCase()])
+              .filter(Boolean)
+              .map(opt => cleanString(opt));
+
+            if (mappedAnswer.length === 1) {
+              const matchedVal = raw[mappedAnswer.toUpperCase()] || raw[mappedAnswer.toLowerCase()];
+              if (matchedVal) {
+                mappedAnswer = cleanString(matchedVal);
+              }
+            }
           }
         } catch (e) {
-          console.error(`Failed to parse options for Question ${q.id}. Raw data:`, q.options);
+          console.error(`Failed to parse options for Question ${q.id}.`, e);
         }
 
         if (parsedOptions.length === 0) {
@@ -126,17 +142,17 @@ export default function LearnerActiveExamPage() {
 
         return {
           id: q.id,
-          text: q.question,
+          text: cleanString(q.question),
           options: parsedOptions,
-          correctAnswer: String(q.correct_answer),
+          correctAnswer: mappedAnswer,
         };
       });
 
       setQuestions(formattedQuestions);
       
-      // Step C: Timer setup & Start Time Capture
       const endTimeKey = `exam_endtime_${examId}`;
       const startTimeKey = `exam_starttime_${examId}`;
+      const loggedKey = `exam_started_logged_${examId}_${user.id}`; // Prevents duplicate logging on refresh
       
       let storedEndTime = sessionStorage.getItem(endTimeKey);
       let storedStartTime = sessionStorage.getItem(startTimeKey);
@@ -156,6 +172,41 @@ export default function LearnerActiveExamPage() {
         sessionStorage.setItem(endTimeKey, endTime.toString());
       }
 
+      // ---> NEW: Log the exam initiation to AuditLogs (only once per session)
+      if (!sessionStorage.getItem(loggedKey)) {
+        const { data: userData } = await supabase
+          .from('Users')
+          .select('email, Roles ( role_name )')
+          .eq('user_id', user.id)
+          .single();
+
+        const userEmail = userData?.email || user.email || 'System';
+        
+        let roleName = 'Learner';
+        if (userData?.Roles) {
+          if (Array.isArray(userData.Roles) && userData.Roles.length > 0) {
+            roleName = (userData.Roles[0] as any).role_name || 'Learner';
+          } else if (!Array.isArray(userData.Roles)) {
+            roleName = (userData.Roles as any).role_name || 'Learner';
+          }
+        }
+
+        await supabase.from('AuditLogs').insert([
+          {
+            user_email: userEmail,
+            role: roleName,
+            action: `Initiated active exam session: "${exam.exam_title}"`,
+            type: 'User Activity',
+            severity: 'Info',
+            ip_address: 'Internal',
+            user_agent: navigator.userAgent
+          }
+        ]);
+        
+        // Mark it as logged in this session to prevent spamming the logs if they refresh the page
+        sessionStorage.setItem(loggedKey, 'true');
+      }
+
       const calculatedTimeLeft = Math.max(0, Math.floor((endTime - Date.now()) / 1000));
       setTimeLeft(calculatedTimeLeft);
       setIsLoading(false);
@@ -164,7 +215,6 @@ export default function LearnerActiveExamPage() {
     fetchExamAndQuestions();
   }, [params, router, addToast]);
 
-  // 2. Countdown Timer Interval
   useEffect(() => {
     if (isLoading || isSubmitting || showTimeUpModal) return;
 
@@ -192,7 +242,6 @@ export default function LearnerActiveExamPage() {
     return () => clearInterval(timerInterval);
   }, [isLoading, isSubmitting, showTimeUpModal, params]);
 
-  // 3. Auto-submit grace period timer after time is up popup shows
   useEffect(() => {
     if (showTimeUpModal && !isSubmitting) {
       const autoSubmitTimer = setTimeout(() => {
@@ -233,7 +282,6 @@ export default function LearnerActiveExamPage() {
     }
   };
 
-  // 4. Final Submission Logic
   const handleFinalSubmit = async () => {
     if (isSubmitting) return;
     setIsSubmitting(true);
@@ -242,7 +290,6 @@ export default function LearnerActiveExamPage() {
 
     const examId = params?.id as string;
     
-    // Clean up session storage
     sessionStorage.removeItem(`exam_endtime_${examId}`);
     sessionStorage.removeItem(`exam_starttime_${examId}`);
 
@@ -253,6 +300,7 @@ export default function LearnerActiveExamPage() {
       let correctCount = 0;
       questions.forEach((q) => {
         const studentChoice = answers[q.id];
+        // The strings are perfectly clean in state, so direct === works flawlessly
         if (studentChoice && studentChoice === q.correctAnswer) {
           correctCount++;
         }
@@ -260,7 +308,6 @@ export default function LearnerActiveExamPage() {
 
       const finalPercentageScore = Math.round((correctCount / questions.length) * 100);
 
-      // Pass both started_at and completed_at to satisfy Postgres constraints
       const { data: attemptData, error: attemptError } = await supabase
         .from('Student Attempts')
         .insert({
@@ -280,12 +327,11 @@ export default function LearnerActiveExamPage() {
 
       const attemptId = attemptData.attempt_id;
 
-      // Map answers exactly to the schema (REMOVED student_id)
       const answerPayloads = questions.map((q) => ({
         attempt_id: attemptId,
         question_id: q.id,
         selected_option: answers[q.id] || null,
-        is_correct: answers[q.id] === q.correctAnswer,
+        is_correct: answers[q.id] === q.correctAnswer, 
       }));
 
       const { error: answersError } = await supabase
@@ -301,7 +347,7 @@ export default function LearnerActiveExamPage() {
     } catch (error) {
       console.error('Failed to submit exam:', error);
       addToast("Failed to submit exam. Please try again.", "error");
-      setIsSubmitting(false); // Unlock button if an error occurs so they can try again
+      setIsSubmitting(false); 
     }
   };
 

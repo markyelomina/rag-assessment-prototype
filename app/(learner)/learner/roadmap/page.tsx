@@ -46,7 +46,7 @@ export default function RoadmapPage() {
           final_score,
           completed_at,
           exam_id,
-          exam:Exams!inner ( exam_title, exam_subject, global_status, grading_logic, passing_score )
+          exam:Exams!inner ( exam_title, exam_subject, global_status, grading_logic, passing_score, passing_percentage )
         `)
         .eq('student_id', user.id)
         .eq('exam_status', 'completed')
@@ -76,15 +76,15 @@ export default function RoadmapPage() {
           const title = (examData?.exam_title || '').toLowerCase();
           const subject = examData?.exam_subject || '';
           
-          // Pull the dynamic passing score set by the teacher (fallback to 60 if missing)
-          const passingTarget = examData?.passing_score || 60;
+          // Use passing_percentage if available, otherwise fallback to passing_score or 75
+          const passingTarget = examData?.passing_percentage || examData?.passing_score || 75;
           
           let calculatedScore = 0;
           if (logic === 'highest') calculatedScore = Math.max(...group.map(a => a.final_score || 0));
           else if (logic === 'average') calculatedScore = group.reduce((s, a) => s + (a.final_score || 0), 0) / group.length;
           else calculatedScore = group[0].final_score || 0; // 'latest'
 
-          // The Progress Engine Evaluator (Uses the specific exam's passing score)
+          // The Progress Engine Evaluator
           if (calculatedScore >= passingTarget) {
             if (title.includes('diagnostic')) {
               stats.diagnosticPassed = true;
@@ -119,7 +119,8 @@ export default function RoadmapPage() {
       else if (dbPhase === 4 && stats.fullLengthPassed) updatedPhase = 5;
 
       if (updatedPhase > dbPhase) {
-        await supabase
+        // Attempt database save
+        const { error: upsertError } = await supabase
           .from('Roadmap Progress')
           .upsert({ 
             student_id: user.id, 
@@ -128,8 +129,16 @@ export default function RoadmapPage() {
             onConflict: 'student_id' 
           });
           
+        if (upsertError) console.error("Roadmap save error:", upsertError);
+        
+        // Bulletproof Check: Ensure celebration only triggers once per phase locally
+        const celebratedKey = `celebrated_${user.id}_phase_${updatedPhase}`;
+        if (!localStorage.getItem(celebratedKey)) {
+          setShowCelebration(true);
+          localStorage.setItem(celebratedKey, 'true');
+        }
+          
         dbPhase = updatedPhase;
-        setShowCelebration(true);
       }
 
       setCurrentDbPhase(dbPhase);

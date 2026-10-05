@@ -24,12 +24,50 @@ export default function LearnerCalendarPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [dismissedNotifications, setDismissedNotifications] = useState<string[]>([]);
 
+  // Load dismissed notifications from localStorage on initial render
+  useEffect(() => {
+    const savedDismissals = localStorage.getItem('dismissedMissedExams');
+    if (savedDismissals) {
+      try {
+        setDismissedNotifications(JSON.parse(savedDismissals));
+      } catch (e) {
+        console.error("Could not parse dismissed notifications from local storage");
+      }
+    }
+  }, []);
+
   useEffect(() => {
     const fetchSchedule = async () => {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
 
-      // Query Exams and join attempts, including passing_percentage
+      // 1. Explicitly fetch the student's cohort_id
+      const { data: userData } = await supabase
+        .from('Users')
+        .select('cohort_id')
+        .eq('user_id', user.id)
+        .single();
+
+      if (!userData?.cohort_id) {
+        setIsLoading(false);
+        return;
+      }
+
+      // 2. Fetch Exam IDs strictly linked to this student's cohort
+      const { data: cohortExams } = await supabase
+        .from('Exam_Cohorts')
+        .select('exam_id')
+        .eq('cohort_id', userData.cohort_id);
+
+      const examIds = cohortExams?.map(ce => ce.exam_id) || [];
+
+      if (examIds.length === 0) {
+        setWeeklySchedule([]);
+        setIsLoading(false);
+        return;
+      }
+
+      // 3. Safely fetch ONLY the exams for this cohort that are or were available to students
       const { data: exams, error } = await supabase
         .from('Exams')
         .select(`
@@ -45,7 +83,8 @@ export default function LearnerCalendarPage() {
           passing_percentage,
           attempts:"Student Attempts" ( attempt_id, final_score )
         `)
-        .neq('global_status', 'Hidden')
+        .in('exam_id', examIds)
+        .in('global_status', ['Active', 'Inactive']) 
         .order('schedule_start', { ascending: true });
 
       if (error) {
@@ -73,15 +112,19 @@ export default function LearnerCalendarPage() {
           highestScore = Math.max(...attempts.map((a: any) => a.final_score || 0));
         }
         
-        // Determine the dynamic status based on attempt/deadline rules
+        // Determine the dynamic status based on attempt limits and time
         let currentStatus = 'Upcoming';
         
         if (attemptCount >= maxAttempts) {
           currentStatus = 'Completed';
-        } else if (examEndDate && exam.close_after_deadline && now > examEndDate) {
+        } else if (exam.global_status === 'Inactive' || (examEndDate && exam.close_after_deadline && now > examEndDate)) {
           currentStatus = 'Closed';
         } else if (now >= examDate) {
-          currentStatus = 'Pending';
+          if (exam.global_status === 'Active') {
+            currentStatus = 'Available';
+          } else {
+            currentStatus = 'Awaiting Teacher Activation';
+          }
         }
 
         // Evaluate if the goal was met (comparing score percentage against target percentage)
@@ -118,6 +161,15 @@ export default function LearnerCalendarPage() {
     fetchSchedule();
   }, []);
 
+  const handleDismissNotification = (examId: string) => {
+    setDismissedNotifications(prev => {
+      const updatedList = [...prev, examId];
+      // Save the updated list permanently to the browser
+      localStorage.setItem('dismissedMissedExams', JSON.stringify(updatedList));
+      return updatedList;
+    });
+  };
+
   const today = new Date();
   const currentMonthName = today.toLocaleString('en-US', { month: 'long' });
   const currentYear = today.getFullYear();
@@ -135,10 +187,11 @@ export default function LearnerCalendarPage() {
         const day = parseInt(match[0]);
         const existingStatus = examDaysMap.get(day);
 
+        // Priority Hierarchy
         if (schedule.status === 'Closed') {
           examDaysMap.set(day, 'Closed'); 
-        } else if ((schedule.status === 'Pending' || schedule.status === 'Upcoming') && existingStatus !== 'Closed') {
-          examDaysMap.set(day, 'Pending'); 
+        } else if ((schedule.status === 'Available' || schedule.status === 'Upcoming' || schedule.status === 'Awaiting Teacher Activation') && existingStatus !== 'Closed') {
+          examDaysMap.set(day, 'Available'); 
         } else if (!existingStatus) {
           examDaysMap.set(day, 'Completed'); 
         }
@@ -150,7 +203,7 @@ export default function LearnerCalendarPage() {
   );
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 pb-24">
 
       {missedExams.length > 0 && (
         <div className="space-y-3 mb-6 animate-in fade-in slide-in-from-top-4 duration-300">
@@ -164,7 +217,7 @@ export default function LearnerCalendarPage() {
                 </div>
               </div>
               <button 
-                onClick={() => exam.id && setDismissedNotifications(prev => [...prev, exam.id!])} 
+                onClick={() => exam.id && handleDismissNotification(exam.id)} 
                 className="px-4 py-2 bg-white text-rose-600 text-xs font-bold rounded-lg border border-rose-200 hover:bg-rose-100 transition-colors whitespace-nowrap shadow-sm w-full md:w-auto"
               >
                 Dismiss Alert
@@ -197,8 +250,9 @@ export default function LearnerCalendarPage() {
                   </div>
                   <span className={`px-3 py-1.5 rounded-full text-xs font-bold shrink-0 ${
                     schedule.status === 'Completed' ? 'bg-emerald-100 text-emerald-800' : 
-                    schedule.status === 'Pending' ? 'bg-blue-100 text-blue-800' : 
+                    schedule.status === 'Available' ? 'bg-blue-100 text-blue-800' : 
                     schedule.status === 'Closed' ? 'bg-rose-100 text-rose-800' :
+                    schedule.status === 'Awaiting Teacher Activation' ? 'bg-amber-100 text-amber-800' :
                     'bg-slate-100 text-slate-600'
                   }`}>
                     {schedule.status}
@@ -222,9 +276,14 @@ export default function LearnerCalendarPage() {
                       View Performance Dashboard
                     </button>
                   )}
-                  {schedule.status === 'Pending' && (
-                    <button onClick={() => router.push('/learner/exams')} className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg transition-colors shadow-sm">
-                      Open Exam Selection
+                  {schedule.status === 'Available' && (
+                    <button onClick={() => router.push(`/learner/exams/${schedule.id}`)} className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-lg transition-colors shadow-sm">
+                      Start Exam
+                    </button>
+                  )}
+                  {schedule.status === 'Awaiting Teacher Activation' && (
+                    <button disabled className="px-4 py-2 bg-amber-50 text-amber-500 border border-amber-200 text-xs font-bold rounded-lg cursor-not-allowed">
+                      Pending Teacher Approval
                     </button>
                   )}
                   {schedule.status === 'Closed' && (
@@ -244,22 +303,26 @@ export default function LearnerCalendarPage() {
         </div>
 
         <div className="lg:col-span-1 space-y-6">
+          
           <div className="bg-white p-6 rounded-xl border border-slate-100 shadow-sm">
             <h3 className="font-bold text-slate-800 mb-4">{currentMonthName} {currentYear} Schedule</h3>
             <div className="grid grid-cols-7 gap-1 text-center text-xs font-bold text-slate-400 mb-2">
               <div>Su</div><div>Mo</div><div>Tu</div><div>We</div><div>Th</div><div>Fr</div><div>Sa</div>
             </div>
             <div className="grid grid-cols-7 gap-1 text-center text-sm font-bold text-slate-700">
+              
               {Array.from({ length: firstDayOfMonth }).map((_, i) => (
                 <div key={`empty-${i}`} className="p-1.5"></div>
               ))}
+              
               {Array.from({ length: daysInMonth }, (_, i) => i + 1).map(day => {
                 const dayStatus = examDaysMap.get(day);
+                
                 let highlightClass = 'hover:bg-slate-100 text-slate-700';
                 
                 if (dayStatus === 'Closed') {
                   highlightClass = 'bg-rose-500 text-white shadow-sm ring-2 ring-rose-200 ring-offset-1';
-                } else if (dayStatus === 'Pending') {
+                } else if (dayStatus === 'Available') {
                   highlightClass = 'bg-blue-600 text-white shadow-sm ring-2 ring-blue-200 ring-offset-1';
                 } else if (dayStatus === 'Completed') {
                   highlightClass = 'bg-slate-400 text-white shadow-sm ring-2 ring-slate-200 ring-offset-1';
