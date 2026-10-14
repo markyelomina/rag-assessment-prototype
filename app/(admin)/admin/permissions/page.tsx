@@ -1,5 +1,6 @@
 'use client';
 
+import FullScreenLoader from '@/components/ui/FullScreenLoader';
 import React, { useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabaseClient';
 import { useToast } from '@/components/ui/ToastContext';
@@ -156,11 +157,10 @@ export default function AdminPermissionsPage() {
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center min-h-[60vh]">
-        <div className="p-12 text-center text-slate-500 font-bold bg-white rounded-xl border border-slate-200">
-          Syncing roles and permissions...
-        </div>
-      </div>
+      <FullScreenLoader 
+        isOpen={isLoading || isSaving} 
+        message="Syncing roles and permissions..." 
+      />
     );
   }
 

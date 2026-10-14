@@ -17,7 +17,6 @@ export function useIngestion({ onSuccess }: UseIngestionProps = {}) {
 
   const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
 
-  // Prevent stale closures on the success callback
   const onSuccessRef = useRef(onSuccess);
   useEffect(() => {
     onSuccessRef.current = onSuccess;
@@ -44,7 +43,7 @@ export function useIngestion({ onSuccess }: UseIngestionProps = {}) {
       }
     } catch (error) {
       setStatus('FAILURE');
-      setProgressDetails({ message: 'Failed to connect to the local FastAPI tunnel.' });
+      setProgressDetails({ message: 'Failed to connect to backend.' });
       console.error(error);
     }
   }, [API_BASE_URL]);
@@ -69,11 +68,20 @@ export function useIngestion({ onSuccess }: UseIngestionProps = {}) {
         } 
         else if (data.status === 'PROCESSING') {
           setStatus('PROCESSING');
-          setProgressDetails(data.details); // Captures step & details from FastAPI
+          setProgressDetails(data.details);
         } 
         else if (data.status === 'SUCCESS') {
+          // Check if the task returned a failure payload
+          if (data.final_result?.status === 'FAILURE' || data.final_result?.status === 'Error') {
+            setStatus('FAILURE');
+            setProgressDetails({ message: data.final_result?.message || 'Processing failed.' });
+            clearInterval(interval);
+            setTaskId(null);
+            return;
+          }
+
           setStatus('SUCCESS');
-          setProgressDetails({ message: 'File successfully vectorized and migrated to the indexed folder.' });
+          setProgressDetails({ message: 'File successfully vectorized and indexed.' });
           clearInterval(interval);
           setTaskId(null);
           

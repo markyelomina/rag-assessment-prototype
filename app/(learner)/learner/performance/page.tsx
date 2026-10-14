@@ -1,5 +1,6 @@
 'use client';
 
+import FullScreenLoader from '@/components/ui/FullScreenLoader';
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { Radar, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer } from 'recharts';
@@ -455,6 +456,10 @@ export default function UnifiedPerformancePage() {
           </div>
         </div>
       )}
+      <FullScreenLoader 
+        isOpen={isLoading} 
+        message="Loading performance data..." 
+      />
     </div>
   );
 }

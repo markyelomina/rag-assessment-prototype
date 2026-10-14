@@ -1,5 +1,6 @@
 'use client';
 
+import FullScreenLoader from '@/components/ui/FullScreenLoader';
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import EmptyState from '@/components/ui/EmptyState';
@@ -326,6 +327,10 @@ export default function AdminLogsPage() {
           </div>
         </div>
       )}
+      <FullScreenLoader 
+        isOpen={isLoading} 
+        message="Loading audit logs..." 
+      />
     </div>
   );
 }

@@ -13,6 +13,7 @@ interface ScheduleItem {
   goalMet: boolean | null; 
 }
 
+import FullScreenLoader from '@/components/ui/FullScreenLoader';
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
@@ -370,6 +371,10 @@ export default function LearnerCalendarPage() {
           </div>
         </div>
       </div>
+      <FullScreenLoader 
+        isOpen={isLoading} 
+        message="Loading weekly activities..." 
+      />
     </div>
   );
 }

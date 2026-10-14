@@ -1,5 +1,6 @@
 'use client';
 
+import FullScreenLoader from '@/components/ui/FullScreenLoader';
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
@@ -15,6 +16,7 @@ interface DashboardExam {
 
 export default function FacultyDashboardPage() {
   const router = useRouter();
+  const [isNavigating, setIsNavigating] = useState(false);
   const [facultyName, setFacultyName] = useState<string>('Instructor');
   const [examsList, setExamsList] = useState<DashboardExam[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -174,9 +176,10 @@ export default function FacultyDashboardPage() {
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center min-h-[60vh]">
-        <p className="text-slate-500 font-bold">Loading dashboard...</p>
-      </div>
+      <FullScreenLoader 
+        isOpen={isLoading} 
+        message="Loading dashboard overview..." 
+      />
     );
   }
 
@@ -188,7 +191,7 @@ export default function FacultyDashboardPage() {
           <p className="text-sm text-slate-500 mt-1 font-bold">Here is a summary of your upcoming exams and pending validations for this week.</p>
         </div>
         <button 
-          onClick={() => router.push('/faculty/exams/create')}
+          onClick={() => {setIsNavigating(true);  router.push('/faculty/exams/create')}}
           className="px-6 py-2.5 bg-blue-600 text-white text-sm font-bold rounded-lg hover:bg-blue-700 transition-colors shadow-sm whitespace-nowrap"
         >
           + Create New Exam
@@ -283,6 +286,10 @@ export default function FacultyDashboardPage() {
           </table>
         </div>
       </div>
+      <FullScreenLoader 
+    isOpen={isNavigating} 
+    message="Loading exam creation page..." 
+  />
     </div>
   );
 }

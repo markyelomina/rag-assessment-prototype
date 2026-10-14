@@ -1,5 +1,6 @@
 'use client';
 
+import FullScreenLoader from '@/components/ui/FullScreenLoader';
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabaseClient';
@@ -21,7 +22,7 @@ const TOS_TOPICS: Record<string, string[]> = {
     "A.4 Intelligence and Cognitive Assessment",
     "A.5 Personality Assessment"
   ],
-  "Industrial Organizational Psychology": [
+  "Industrial-Organizational Psychology": [
     "A.1 Organizational Theories, Models and Concepts",
     "A.2 Recruitment, Selection and Placement",
     "A.3 Training and Development",
@@ -39,7 +40,16 @@ const TOS_TOPICS: Record<string, string[]> = {
 
 const BLOOM_LEVELS = ['Remembering', 'Understanding', 'Applying', 'Analyzing', 'Evaluating', 'Creating'];
 
-type CustomBlock = { id: string; topic: string; customTopicInput: string; bloom: string; count: number };
+type CustomBlock = { 
+  id: string; 
+  topic: string; 
+  customTopicInput: string; 
+  bloom: string; 
+  count: number;
+  setting: string;
+  customSettingInput: string;
+};
+
 type Cohort = { id: string; name: string };
 
 const getSourceFromPath = (path: string) => path.split('/').pop() || path;
@@ -47,12 +57,9 @@ const getSourceFromPath = (path: string) => path.split('/').pop() || path;
 // Converts Local HTML input format -> Strict UTC string for the database
 const localToUTC = (localString: string | null | undefined): string | null => {
   if (!localString) return null;
-  // Manually split the string to avoid browser guessing games
   const [datePart, timePart] = localString.split('T');
   const [year, month, day] = datePart.split('-').map(Number);
   const [hours, minutes] = timePart.split(':').map(Number);
-  
-  // This constructor explicitly forces the computer's local timezone
   const d = new Date(year, month - 1, day, hours, minutes);
   return d.toISOString();
 };
@@ -74,10 +81,10 @@ export default function CreateExamPage() {
   const [isCohortDropdownOpen, setIsCohortDropdownOpen] = useState(false);
   const [scheduleStart, setScheduleStart] = useState('');
   const [scheduleEnd, setScheduleEnd] = useState('');
-  const [passingScorePercent, setPassingScorePercent] = useState(75);
+  const [passingScorePercent, setPassingScorePercent] = useState<number>(75);
   const [timeLimit, setTimeLimit] = useState(60);
   
-  // NEW Form State - Step 1 (Attempt & Grading Rules)
+  // Attempt & Grading Rules
   const [maxAttempts, setMaxAttempts] = useState<number>(1);
   const [gradingLogic, setGradingLogic] = useState<'highest' | 'latest' | 'average'>('highest');
   const [closeAfterDeadline, setCloseAfterDeadline] = useState<boolean>(true);
@@ -85,14 +92,19 @@ export default function CreateExamPage() {
   // Form State - Step 2 (Parameters)
   const [subject, setSubject] = useState('Abnormal Psychology');
   const [generationMode, setGenerationMode] = useState<'strict' | 'custom'>('strict');
+  const [availableSettings, setAvailableSettings] = useState<string[]>([]);
   const [customBlocks, setCustomBlocks] = useState<CustomBlock[]>([
-    { id: 'initial-1', topic: '', customTopicInput: '', bloom: '', count: 5 }
+    { id: 'initial-1', topic: '', customTopicInput: '', bloom: '', count: 5, setting: '', customSettingInput: '' }
   ]);
   
   // Form State - Step 3 (Sources)
   const [availableMaterials, setAvailableMaterials] = useState<any[]>([]);
   const [selectedMaterials, setSelectedMaterials] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
+
+  // Modals
+  const [serverDownModal, setServerDownModal] = useState(false);
+  const [showProgressModal, setShowProgressModal] = useState(false);
 
   // Watch for Generation Success to Auto-Redirect
   useEffect(() => {
@@ -135,6 +147,79 @@ export default function CreateExamPage() {
     fetchInitialData();
   }, []);
 
+  // Fetch Domain Settings when subject changes
+  useEffect(() => {
+    const fetchSettings = async () => {
+      const { data, error } = await supabase
+        .from('Domain_Settings')
+        .select('setting_name')
+        .eq('subject', subject);
+      
+      if (!error && data) {
+        setAvailableSettings(data.map((d: any) => d.setting_name));
+      } else {
+        setAvailableSettings([]);
+      }
+    };
+    fetchSettings();
+  }, [subject]);
+
+  // Heartbeat verification
+  const checkWorkerHeartbeat = async (): Promise<boolean> => {
+    try {
+      // 1. Primary check: Use the same telemetry endpoint as AdminOverviewPage
+      try {
+        const telRes = await fetch('/api/telemetry');
+        if (telRes.ok) {
+          const telData = await telRes.json();
+          const workerStatus = telData.backendHealth?.aiWorker?.toLowerCase();
+          if (workerStatus === 'operational') {
+            console.log('[Heartbeat Verified via /api/telemetry]: Operational');
+            return true;
+          }
+        }
+      } catch (e) {
+        console.warn('[/api/telemetry check bypassed, falling back to Supabase]:', e);
+      }
+
+      // 2. Secondary check: Query Worker_Health table directly
+      const { data, error } = await supabase
+        .from('Worker_Health')
+        .select('*')
+        .eq('worker_name', 'ai_celery_worker')
+        .order('last_heartbeat', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (error) {
+        console.error('[Worker_Health DB Error]:', error);
+        return false;
+      }
+
+      if (!data) {
+        console.warn('[Worker_Health]: No heartbeat record found.');
+        return false;
+      }
+
+      // Case-insensitive status check
+      const isStatusOk = data.status?.toLowerCase() === 'operational';
+      if (!isStatusOk) {
+        console.warn(`[Worker_Health Status Mismatch]: Expected operational, got "${data.status}"`);
+        return false;
+      }
+
+      // Timestamp check with a 5-minute safety window for clock skew
+      const lastBeatTime = new Date(data.last_heartbeat).getTime();
+      const diffMinutes = (Date.now() - lastBeatTime) / (1000 * 60);
+
+      console.log(`[Worker Heartbeat Verified]: Last pulse was ${diffMinutes.toFixed(1)} mins ago.`);
+      return diffMinutes <= 5;
+    } catch (err) {
+      console.error('[Heartbeat Check Exception]:', err);
+      return false;
+    }
+  };
+
   const strictItemCount = subject === 'Psychological Assessment' ? 130 : 100;
   const isFormLocked = isSubmitting || genStatus === 'PROCESSING';
 
@@ -153,9 +238,16 @@ export default function CreateExamPage() {
     setErrors({...errors, cohort: false});
   };
 
-  const handleAddBlock = () => setCustomBlocks([...customBlocks, { id: Date.now().toString(), topic: '', customTopicInput: '', bloom: '', count: 1 }]);
+  const handleAddBlock = () => setCustomBlocks([
+    ...customBlocks, 
+    { id: Date.now().toString(), topic: '', customTopicInput: '', bloom: '', count: 1, setting: '', customSettingInput: '' }
+  ]);
+
   const handleRemoveBlock = (id: string) => customBlocks.length > 1 && setCustomBlocks(customBlocks.filter(b => b.id !== id));
-  const updateBlock = (id: string, field: keyof CustomBlock, value: string | number) => setCustomBlocks(customBlocks.map(b => b.id === id ? { ...b, [field]: value } : b));
+  
+  const updateBlock = (id: string, field: keyof CustomBlock, value: string | number) => {
+    setCustomBlocks(customBlocks.map(b => b.id === id ? { ...b, [field]: value } : b));
+  };
   
   const toggleMaterialSelection = (filePath: string) => {
     const sourceName = getSourceFromPath(filePath);
@@ -181,7 +273,12 @@ export default function CreateExamPage() {
     }
     
     if (currentStep === 2 && generationMode === 'custom') {
-      const incompleteBlocks = customBlocks.some(b => !b.topic || (b.topic === 'Other' && !b.customTopicInput) || !b.bloom);
+      const incompleteBlocks = customBlocks.some(b => 
+        !b.topic || 
+        (b.topic === 'Other' && !b.customTopicInput) || 
+        !b.bloom ||
+        (b.setting === 'Other' && !b.customSettingInput)
+      );
       if (incompleteBlocks) {
         newErrors.customBlocks = true;
         setErrors(newErrors);
@@ -202,12 +299,24 @@ export default function CreateExamPage() {
   };
 
   const handleGenerate = async () => {
+    // 1. Single-click guard: Block duplicate requests
+    if (isSubmitting || isFormLocked) return;
+
     if (selectedMaterials.length === 0) {
       setErrors({ materials: true });
       return;
     }
+
     setErrors({});
     setIsSubmitting(true);
+
+    // 2. Pre-check worker heartbeat before committing to Supabase
+    const isWorkerAlive = await checkWorkerHeartbeat();
+    if (!isWorkerAlive) {
+      setIsSubmitting(false);
+      setServerDownModal(true);
+      return;
+    }
 
     const sessionUUID = crypto.randomUUID(); 
     
@@ -216,11 +325,10 @@ export default function CreateExamPage() {
       : customBlocks.reduce((acc, block) => acc + block.count, 0);
     const exactPassingScore = Math.round(totalItems * (passingScorePercent / 100));
 
-    // Convert Local inputs -> strict UTC before inserting into the database
     const scheduleStartUTC = localToUTC(scheduleStart);
     const scheduleEndUTC = localToUTC(scheduleEnd);
 
-    // 1. Insert parent record with status 'Generating' AND new settings
+    // 3. Insert parent record
     const { error: dbError } = await supabase.from('Exams').insert({
       exam_id: sessionUUID,
       exam_title: examTitle,
@@ -243,7 +351,7 @@ export default function CreateExamPage() {
       return;
     }
 
-    // 2. Map cohorts
+    // 4. Map cohorts
     const cohortPayload = selectedCohorts.map(cohortId => ({
       exam_id: sessionUUID,
       cohort_id: cohortId
@@ -257,19 +365,16 @@ export default function CreateExamPage() {
       return;
     }
 
+    // 5. Audit log
     const { data: { user } } = await supabase.auth.getUser();
     if (user) {
       const { data: userData } = await supabase
         .from('Users')
-        .select(`
-          email,
-          Roles ( role_name )
-        `)
+        .select(`email, Roles ( role_name )`)
         .eq('user_id', user.id)
         .single();
 
       const userEmail = userData?.email || user.email || 'System';
-      
       let roleName = 'Teacher';
       if (userData?.Roles) {
         if (Array.isArray(userData.Roles) && userData.Roles.length > 0) {
@@ -292,11 +397,14 @@ export default function CreateExamPage() {
       ]);
     }
 
-    // 3. Trigger the asynchronous generation hook
+    // Show progress modal
+    setShowProgressModal(true);
+
+    // 6. Trigger generation task
     if (generationMode === 'strict') {
       const blueprintMap: Record<string, string> = {
         "Abnormal Psychology": "1",
-        "Industrial Organizational Psychology": "2",
+        "Industrial-Organizational Psychology": "2",
         "Psychological Assessment": "3",
         "Developmental Psychology": "4"
       };
@@ -310,10 +418,17 @@ export default function CreateExamPage() {
         sessionUUID
       );
     } else {
+      const customSettingsPool = Array.from(new Set(
+        customBlocks
+          .map(b => b.setting === 'Other' ? b.customSettingInput.trim() : b.setting)
+          .filter(Boolean)
+      ));
+
       const finalBlocks = customBlocks.map(b => ({
         competency: b.topic === 'Other' ? b.customTopicInput : b.topic,
         bloom: b.bloom,
-        count: b.count
+        count: b.count,
+        setting: b.setting === 'Other' ? b.customSettingInput.trim() : (b.setting || undefined)
       }));
       
       await triggerGeneration(
@@ -321,7 +436,8 @@ export default function CreateExamPage() {
         { 
           subject: subject,
           blocks: finalBlocks, 
-          references: selectedMaterials 
+          references: selectedMaterials,
+          custom_settings: customSettingsPool.length > 0 ? customSettingsPool : undefined
         }, 
         sessionUUID
       );
@@ -366,7 +482,9 @@ export default function CreateExamPage() {
 
       {Object.values(errors).some(Boolean) && (
         <div className="p-4 bg-red-50 border border-red-200 rounded-xl flex items-start gap-3 animate-in fade-in duration-200">
-          <svg className="w-5 h-5 text-red-600 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+          <svg className="w-5 h-5 text-red-600 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+          </svg>
           <p className="text-sm text-red-800 font-bold">
             {typeof errors.database === 'string' ? errors.database : 'Please complete all highlighted fields before proceeding.'}
           </p>
@@ -482,18 +600,33 @@ export default function CreateExamPage() {
                   <label className="block text-sm font-bold text-slate-700 mb-2">Passing Score (%)</label>
                   <div className="flex items-center gap-3">
                     <input 
-                      type="range" min="5" max="100" step="5"
+                      type="range" 
+                      min="1" 
+                      max="100" 
+                      step="1"
                       value={passingScorePercent}
                       onChange={(e) => setPassingScorePercent(Number(e.target.value))}
                       disabled={isFormLocked}
                       className="w-full accent-blue-600"
                     />
-                    <span className="text-sm font-bold text-slate-900 bg-slate-100 px-3 py-1.5 rounded-lg border border-slate-200 min-w-[60px] text-center">
-                      {passingScorePercent}%
-                    </span>
+                    <div className="flex items-center border border-slate-300 rounded-lg bg-white px-2 py-1.5 min-w-[75px] focus-within:border-blue-500 focus-within:ring-1 focus-within:ring-blue-500">
+                      <input 
+                        type="number" 
+                        min="1" 
+                        max="100"
+                        value={passingScorePercent}
+                        onChange={(e) => {
+                          const val = Number(e.target.value);
+                          if (!isNaN(val)) setPassingScorePercent(Math.min(100, Math.max(1, val)));
+                        }}
+                        disabled={isFormLocked}
+                        className="w-10 text-sm font-bold text-slate-900 bg-transparent text-right focus:outline-none"
+                      />
+                      <span className="text-sm font-bold text-slate-500 ml-1">%</span>
+                    </div>
                   </div>
                   <p className="text-[11px] font-bold text-amber-600 mt-2 leading-tight">
-                    Note: The passing score ratio is hard-locked upon creation. It cannot be changed later to preserve the integrity of student analytics.
+                    Note: The passing score ratio is hard-locked upon creation to preserve student analytics integrity.
                   </p>
                 </div>
                 <div>
@@ -508,7 +641,7 @@ export default function CreateExamPage() {
                 </div>
               </div>
 
-              {/* NEW SETTINGS: Attempts & Grading Logic */}
+              {/* Attempts & Grading Rules */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-6 pt-6 border-t border-slate-100">
                 <div>
                   <label className={`block text-sm font-bold mb-2 transition-colors ${errors.attempts ? 'text-red-600' : 'text-slate-700'}`}>Max Attempts Allowed</label>
@@ -587,7 +720,7 @@ export default function CreateExamPage() {
                     <input type="radio" name="generationMode" checked={generationMode === 'custom'} onChange={() => setGenerationMode('custom')} disabled={isFormLocked} className="h-5 w-5 text-blue-600 focus:ring-blue-500 border-slate-300 cursor-pointer disabled:cursor-not-allowed" />
                     <div className="ml-3">
                       <span className="block text-sm font-bold text-slate-800">Custom Diagnostic Mode</span>
-                      <span className="block text-xs font-bold text-slate-500 mt-0.5">Build your own JSON payload</span>
+                      <span className="block text-xs font-bold text-slate-500 mt-0.5">Build your own custom payload & settings</span>
                     </div>
                   </label>
                 </div>
@@ -619,13 +752,13 @@ export default function CreateExamPage() {
                   <div className="flex justify-between items-end border-b border-blue-200 pb-4">
                     <div>
                       <h3 className="font-bold text-blue-900">Custom Payload Builder</h3>
-                      <p className="text-xs text-blue-700 font-bold mt-1">Add specific competency blocks to compile the generation payload.</p>
+                      <p className="text-xs text-blue-700 font-bold mt-1">Configure competencies and target operational contexts for scenario generation.</p>
                     </div>
                     {errors.customBlocks && <span className="text-xs font-bold text-red-600 bg-red-100 px-3 py-1 rounded-md">Incomplete blocks</span>}
                   </div>
                   
                   {customBlocks.map((block, index) => (
-                    <div key={block.id} className={`bg-white p-5 rounded-lg border relative ${errors.customBlocks && (!block.topic || !block.bloom || (block.topic === 'Other' && !block.customTopicInput)) ? 'border-red-400 shadow-[0_0_0_1px_rgba(248,113,113,1)]' : 'border-slate-200 shadow-sm'}`}>
+                    <div key={block.id} className={`bg-white p-5 rounded-lg border relative ${errors.customBlocks && (!block.topic || !block.bloom || (block.topic === 'Other' && !block.customTopicInput) || (block.setting === 'Other' && !block.customSettingInput)) ? 'border-red-400 shadow-[0_0_0_1px_rgba(248,113,113,1)]' : 'border-slate-200 shadow-sm'}`}>
                       <div className="absolute top-3 left-4 text-xs font-bold text-slate-400 uppercase tracking-wider">Block {index + 1}</div>
                       {customBlocks.length > 1 && (
                         <button type="button" onClick={() => handleRemoveBlock(block.id)} className="absolute top-3 right-4 text-slate-400 hover:text-red-500 font-bold text-xs transition-colors">
@@ -633,10 +766,11 @@ export default function CreateExamPage() {
                         </button>
                       )}
                       
-                      <div className="mt-6 flex flex-col md:flex-row gap-5">
-                        <div className="flex-1 space-y-3">
-                          <div>
-                            <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">Topic Filter (TOS)</label>
+                      <div className="mt-6 space-y-4">
+                        {/* Row 1: Topic, Bloom, Count */}
+                        <div className="flex flex-col md:flex-row gap-5">
+                          <div className="flex-1 space-y-2">
+                            <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider">Topic Filter (TOS)</label>
                             <select 
                               value={block.topic}
                               onChange={(e) => updateBlock(block.id, 'topic', e.target.value)}
@@ -647,43 +781,78 @@ export default function CreateExamPage() {
                               {TOS_TOPICS[subject]?.map(t => <option key={t} value={t}>{t}</option>)}
                               <option value="Other">Other (Type custom topic)...</option>
                             </select>
+                            {block.topic === 'Other' && (
+                              <div className="animate-in fade-in slide-in-from-top-1">
+                                <input 
+                                  type="text" 
+                                  placeholder="Type your specific topic or competency..." 
+                                  value={block.customTopicInput}
+                                  onChange={(e) => updateBlock(block.id, 'customTopicInput', e.target.value)}
+                                  disabled={isFormLocked}
+                                  className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm font-bold text-slate-900 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                                />
+                              </div>
+                            )}
                           </div>
-                          {block.topic === 'Other' && (
-                            <div className="animate-in fade-in slide-in-from-top-1">
-                              <input 
-                                type="text"
-                                placeholder="Type your specific topic or competency..."
-                                value={block.customTopicInput}
-                                onChange={(e) => updateBlock(block.id, 'customTopicInput', e.target.value)}
-                                disabled={isFormLocked}
-                                className="w-full px-3 py-2.5 border border-slate-300 rounded-md text-sm font-bold text-slate-900 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                              />
-                            </div>
-                          )}
+                          
+                          <div className="w-full md:w-48">
+                            <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Target Bloom's</label>
+                            <select 
+                              value={block.bloom}
+                              onChange={(e) => updateBlock(block.id, 'bloom', e.target.value)}
+                              disabled={isFormLocked}
+                              className="w-full px-3 py-2.5 border border-slate-300 rounded-md text-sm font-bold text-slate-900 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-white"
+                            >
+                              <option value="" disabled>Select level...</option>
+                              {BLOOM_LEVELS.map(level => <option key={level} value={level}>{level}</option>)}
+                            </select>
+                          </div>
+                          
+                          <div className="w-full md:w-32">
+                            <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Item Count</label>
+                            <input 
+                              type="number" min="1" max="50"
+                              value={block.count}
+                              onChange={(e) => updateBlock(block.id, 'count', Number(e.target.value))}
+                              disabled={isFormLocked}
+                              className="w-full px-3 py-2.5 border border-slate-300 rounded-md text-sm font-bold text-slate-900 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-center"
+                            />
+                          </div>
                         </div>
-                        
-                        <div className="w-full md:w-48">
-                          <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">Target Bloom's</label>
-                          <select 
-                            value={block.bloom}
-                            onChange={(e) => updateBlock(block.id, 'bloom', e.target.value)}
-                            disabled={isFormLocked}
-                            className="w-full px-3 py-2.5 border border-slate-300 rounded-md text-sm font-bold text-slate-900 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-white"
-                          >
-                            <option value="" disabled>Select level...</option>
-                            {BLOOM_LEVELS.map(level => <option key={level} value={level}>{level}</option>)}
-                          </select>
-                        </div>
-                        
-                        <div className="w-full md:w-32">
-                          <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">Item Count</label>
-                          <input 
-                            type="number" min="1" max="50"
-                            value={block.count}
-                            onChange={(e) => updateBlock(block.id, 'count', Number(e.target.value))}
-                            disabled={isFormLocked}
-                            className="w-full px-3 py-2.5 border border-slate-300 rounded-md text-sm font-bold text-slate-900 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-center"
-                          />
+
+                        {/* Row 2: Operational Context / Domain Setting */}
+                        <div className="pt-3 border-t border-slate-100">
+                          <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">
+                            Operational Context / Vignette Setting (Optional)
+                          </label>
+                          <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center">
+                            <select 
+                              value={block.setting}
+                              onChange={(e) => updateBlock(block.id, 'setting', e.target.value)}
+                              disabled={isFormLocked}
+                              className="w-full sm:w-80 px-3 py-2 border border-slate-300 rounded-md text-sm font-bold text-slate-800 focus:outline-none focus:border-blue-500 bg-white"
+                            >
+                              <option value="">Default (Random Database Setting)</option>
+                              {availableSettings.map(s => <option key={s} value={s}>{s}</option>)}
+                              <option value="Other">Other (Input custom setting)...</option>
+                            </select>
+
+                            {block.setting === 'Other' && (
+                              <div className="flex-1 w-full animate-in fade-in slide-in-from-top-1">
+                                <input 
+                                  type="text" 
+                                  placeholder="e.g. Inpatient Psychiatric Ward, BPO Helpdesk" 
+                                  value={block.customSettingInput}
+                                  onChange={(e) => updateBlock(block.id, 'customSettingInput', e.target.value)}
+                                  disabled={isFormLocked}
+                                  className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm font-bold text-slate-900 focus:outline-none focus:border-blue-500 placeholder:font-normal"
+                                />
+                              </div>
+                            )}
+                          </div>
+                          <p className="text-[11px] font-bold text-slate-400 mt-1">
+                            Used to situate HOTS scenarios in realistic workplaces or clinical environments.
+                          </p>
                         </div>
                       </div>
                     </div>
@@ -708,7 +877,9 @@ export default function CreateExamPage() {
         {currentStep === 3 && (
           <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-8 animate-in fade-in slide-in-from-right-4 duration-300">
             <h2 className="text-lg font-bold text-slate-800 mb-6">3. Source References</h2>
-            <p className={`text-sm font-bold mt-1 mb-6 transition-colors ${errors.materials ? 'text-red-600' : 'text-slate-500'}`}>Select the active knowledge base files the AI should use to craft the items.</p>
+            <p className={`text-sm font-bold mt-1 mb-6 transition-colors ${errors.materials ? 'text-red-600' : 'text-slate-500'}`}>
+              Select the active knowledge base files the AI should use to craft the items.
+            </p>
             
             <div className={`border rounded-xl bg-slate-50 overflow-hidden ${errors.materials ? 'border-red-400 ring-1 ring-red-400' : 'border-slate-200'}`}>
               
@@ -776,22 +947,10 @@ export default function CreateExamPage() {
                 )}
               </div>
             </div>
-
-            {genStatus === 'PROCESSING' && (
-              <div className="mt-8 bg-blue-50 border border-blue-200 rounded-xl p-5 shadow-sm animate-in fade-in slide-in-from-bottom-2">
-                <div className="flex justify-between items-center mb-3">
-                  <h4 className="text-sm font-bold text-blue-900 flex items-center gap-2">
-                    <svg className="animate-spin h-4 w-4 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                    Processing Generation
-                  </h4>
-                </div>
-                <p className="text-sm text-blue-800 font-bold">{genMessage}</p>
-                <p className="text-xs text-blue-600 mt-2">You may safely navigate away from this page. The exam will appear in your dashboard once finished.</p>
-              </div>
-            )}
           </div>
         )}
 
+        {/* BOTTOM FIXED BAR */}
         <div className="fixed bottom-0 left-0 right-0 md:left-72 bg-white border-t border-slate-200 p-4 shadow-lg z-20">
           <div className="max-w-4xl mx-auto flex justify-between items-center gap-4">
             <div>
@@ -806,7 +965,12 @@ export default function CreateExamPage() {
               {currentStep < 3 ? (
                 <button type="button" onClick={handleNext} className="min-w-[140px] px-8 py-3 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold rounded-lg transition-colors shadow-sm">Next Step</button>
               ) : (
-                <button type="button" onClick={handleGenerate} disabled={isFormLocked} className={`min-w-[180px] px-8 py-3 text-white text-sm font-bold rounded-lg transition-colors shadow-sm flex items-center justify-center gap-2 ${isFormLocked ? 'bg-blue-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}>
+                <button 
+                  type="button" 
+                  onClick={handleGenerate} 
+                  disabled={isFormLocked} 
+                  className={`min-w-[180px] px-8 py-3 text-white text-sm font-bold rounded-lg transition-colors shadow-sm flex items-center justify-center gap-2 ${isFormLocked ? 'bg-blue-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}
+                >
                   {isFormLocked ? (
                     <><svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Queuing...</>
                   ) : (
@@ -818,6 +982,87 @@ export default function CreateExamPage() {
           </div>
         </div>
       </div>
+
+      {/* --- SERVER DOWN MODAL --- */}
+      {serverDownModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-in fade-in duration-200">
+          <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6 border border-slate-200 text-center">
+            <div className="w-12 h-12 rounded-full bg-red-100 text-red-600 flex items-center justify-center mx-auto mb-4">
+              <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+            </div>
+            <h3 className="text-lg font-bold text-slate-800 mb-2">Generation Server Offline</h3>
+            <p className="text-sm text-slate-600 font-bold mb-6">
+              The AI assessment engine is currently unreachable (no active worker heartbeat detected). Exam generation has been halted to prevent unpopulated records. Please try again shortly or contact the administrator.
+            </p>
+            <button 
+              onClick={() => setServerDownModal(false)}
+              className="w-full px-5 py-2.5 bg-slate-800 hover:bg-slate-900 text-white text-sm font-bold rounded-lg transition-colors"
+            >
+              Okay
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* --- BACKGROUND GENERATION PROGRESS POPUP --- */}
+      {showProgressModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-in fade-in duration-200">
+          <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full p-6 border border-slate-200">
+            <div className="flex justify-between items-start mb-4 border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                  <svg className="animate-spin h-5 w-5 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                  </svg>
+                  Processing Exam Generation
+                </h3>
+                <span className="text-xs font-bold text-slate-400">Task ID active in Celery queue</span>
+              </div>
+              <button 
+                onClick={() => router.push('/faculty/exams')} 
+                className="text-slate-400 hover:text-slate-600 p-1"
+                title="Close and return to dashboard"
+              >
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="space-y-4 py-2">
+              <div className="p-4 bg-blue-50/60 border border-blue-200 rounded-lg">
+                <p className="text-sm font-bold text-blue-900">
+                  {genMessage || 'Initiating document retrieval, calibration, and RAGAS evaluation...'}
+                </p>
+                <div className="w-full bg-blue-200/60 h-1.5 rounded-full mt-3 overflow-hidden">
+                  <div className="bg-blue-600 h-full w-2/5 animate-pulse rounded-full"></div>
+                </div>
+              </div>
+
+              <p className="text-xs text-slate-500 font-bold leading-relaxed">
+                This generation is running independently in the background. You do not need to keep this window open. You can safely exit to your dashboard to review pending exams.
+              </p>
+            </div>
+
+            <div className="mt-6 pt-3 border-t border-slate-100 flex justify-end">
+              <button 
+                onClick={() => router.push('/faculty/exams')}
+                className="w-full px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold rounded-lg transition-colors shadow-sm"
+              >
+                Go to Exam Management
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <FullScreenLoader 
+        isOpen={isSubmitting && !showProgressModal && !serverDownModal} 
+        message="Queuing exam generation engine..." 
+      />
     </div>
   );
 }

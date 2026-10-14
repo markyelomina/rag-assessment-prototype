@@ -1,7 +1,7 @@
 'use client';
 
 import { supabase } from '@/lib/supabaseClient';
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 
@@ -13,6 +13,20 @@ export default function LoginPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [errors, setErrors] = useState<{ email?: string; password?: string }>({});
+
+  const [logoUrl, setLogoUrl] = useState('/logo.png');
+  const [platformName, setPlatformName] = useState('DeepCore Prep');
+
+  useEffect(() => {
+    const fetchSettings = async () => {
+      const { data } = await supabase.from('Platform_Settings').select('*').eq('id', 1).single();
+      if (data) {
+        if (data.logo_url) setLogoUrl(data.logo_url);
+        if (data.platform_name) setPlatformName(data.platform_name);
+      }
+    };
+    fetchSettings();
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -121,9 +135,9 @@ export default function LoginPage() {
       
       <div className="pt-10 pb-4 px-8 text-center flex flex-col items-center">
         <img 
-          src="/logo.png" 
-          alt="DeepCore Prep Logo" 
-          className="h-40 w-auto object-contain mix-blend-multiply brightness-110 contrast-125" 
+          src={logoUrl} 
+          alt={`${platformName} Logo`} 
+          className="h-40 w-auto object-contain mix-blend-multiply brightness-110 contrast-125 transition-all duration-300" 
         />
         <p className="text-sm font-bold text-slate-500 mt-2">Sign in to your account</p>
       </div>

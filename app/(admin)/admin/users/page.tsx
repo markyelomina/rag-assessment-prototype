@@ -1,5 +1,6 @@
 "use client";
 
+import FullScreenLoader from '@/components/ui/FullScreenLoader';
 import React, { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import Badge from "@/components/ui/Badge";
@@ -18,6 +19,21 @@ interface UserProfile {
   lastLogin: string;
 }
 
+interface PendingDeactivation {
+  userId: string;
+  userEmail: string;
+}
+
+interface PendingPasswordReset {
+  userId: string;
+  userEmail: string;
+}
+
+interface ResetSuccessInfo {
+  email: string;
+  tempPass: string;
+}
+
 export default function AdminUsersPage() {
   const router = useRouter();
   
@@ -33,7 +49,43 @@ export default function AdminUsersPage() {
 
   const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
   const [dbCohorts, setDbCohorts] = useState<string[]>([]);
+  
+  // Dynamic Loading States
   const [isLoading, setIsLoading] = useState(true);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState("Loading users...");
+
+  // Safety Modal & Countdown States - Deactivation
+  const [pendingDeactivation, setPendingDeactivation] = useState<PendingDeactivation | null>(null);
+  const [deactivateCountdown, setDeactivateCountdown] = useState(5);
+
+  // Safety Modal & Countdown States - Password Reset
+  const [pendingPasswordReset, setPendingPasswordReset] = useState<PendingPasswordReset | null>(null);
+  const [resetCountdown, setResetCountdown] = useState(5);
+  const [resetSuccessInfo, setResetSuccessInfo] = useState<ResetSuccessInfo | null>(null);
+  const [hasCopiedPassword, setHasCopiedPassword] = useState(false);
+
+  // Deactivate Countdown Timer
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (pendingDeactivation && deactivateCountdown > 0) {
+      timer = setTimeout(() => {
+        setDeactivateCountdown((prev) => prev - 1);
+      }, 1000);
+    }
+    return () => clearTimeout(timer);
+  }, [pendingDeactivation, deactivateCountdown]);
+
+  // Reset Password Countdown Timer
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (pendingPasswordReset && resetCountdown > 0) {
+      timer = setTimeout(() => {
+        setResetCountdown((prev) => prev - 1);
+      }, 1000);
+    }
+    return () => clearTimeout(timer);
+  }, [pendingPasswordReset, resetCountdown]);
 
   // Security Redirection
   useEffect(() => {
@@ -44,12 +96,11 @@ export default function AdminUsersPage() {
 
   useEffect(() => {
     const fetchUsersAndCohorts = async () => {
-      // Don't fetch anything if they don't have permission yet
       if (isPermissionsLoading || !manageUsers) return;
 
       setIsLoading(true);
+      setLoadingMessage("Fetching directory data...");
 
-      // Fetch users and cohorts simultaneously
       const [usersResponse, cohortsResponse] = await Promise.all([
         supabase.from("Users").select(`
           *,
@@ -70,12 +121,10 @@ export default function AdminUsersPage() {
         return;
       }
 
-      // Populate dynamic cohort dropdown
       if (cohortsResponse.data) {
         setDbCohorts(cohortsResponse.data.map((c) => c.cohort_name));
       }
 
-      // Map the database rows to the UI structure
       const formattedUsers = usersResponse.data.map((user: any) => {
         let roleName = "Unknown";
         let displayCohort = "N/A";
@@ -118,9 +167,10 @@ export default function AdminUsersPage() {
   }, [isPermissionsLoading, manageUsers]);
 
   const filteredUsers = allUsers.filter((user) => {
+    const safeSearch = (debouncedUserSearch || "").toLowerCase();
     const matchesSearch =
-      user.name.toLowerCase().includes(debouncedUserSearch.toLowerCase()) ||
-      user.email.toLowerCase().includes(debouncedUserSearch.toLowerCase());
+      user.name.toLowerCase().includes(safeSearch) ||
+      user.email.toLowerCase().includes(safeSearch);
     const matchesCohort =
       cohortFilter === "All Cohorts" ||
       user.cohort === cohortFilter ||
@@ -149,8 +199,9 @@ export default function AdminUsersPage() {
     }
   };
 
-  const handleToggleStatus = async (userId: string, currentStatus: string, targetEmail: string) => {
-    const newStatus = currentStatus === "Active" ? "Inactive" : "Active";
+  const executeStatusChange = async (userId: string, newStatus: string, targetEmail: string) => {
+    setLoadingMessage(`Changing status for ${targetEmail}...`);
+    setIsProcessing(true);
 
     const { error } = await supabase
       .from("Users")
@@ -158,7 +209,6 @@ export default function AdminUsersPage() {
       .eq("user_id", userId);
 
     if (!error) {
-      // Instantly update the UI without reloading the page
       setAllUsers((prev) =>
         prev.map((user) =>
           user.id === userId ? { ...user, status: newStatus } : user,
@@ -168,7 +218,7 @@ export default function AdminUsersPage() {
       const { data: sessionData } = await supabase.auth.getUser();
       const adminEmail = sessionData?.user?.email || "Unknown Admin";
 
-      const { error: auditError } = await supabase.from("AuditLogs").insert([
+      await supabase.from("AuditLogs").insert([
         {
           user_email: adminEmail,
           role: "Admin",
@@ -179,25 +229,44 @@ export default function AdminUsersPage() {
           user_agent: navigator.userAgent,
         },
       ]);
-
-      if (auditError) {
-        console.error("Error logging status change:", auditError.message);
-      }
-
     } else {
       console.error("Error toggling status:", error.message);
     }
+    
+    setIsProcessing(false);
   };
 
-  const handleResetPassword = async (userId: string, targetEmail: string) => {
-    const defaultPassword = "malayan@2026";
+  const handleInitiateStatusChange = (userId: string, currentStatus: string, targetEmail: string) => {
+    if (currentStatus === "Active") {
+      setPendingDeactivation({ userId, userEmail: targetEmail });
+      setDeactivateCountdown(5);
+    } else {
+      executeStatusChange(userId, "Active", targetEmail);
+    }
+  };
 
-    if (
-      !confirm(
-        `Are you sure you want to reset the password for ${targetEmail}?`,
-      )
-    )
-      return;
+  const handleConfirmDeactivation = async () => {
+    if (!pendingDeactivation || deactivateCountdown > 0) return;
+    const { userId, userEmail } = pendingDeactivation;
+    setPendingDeactivation(null);
+    await executeStatusChange(userId, "Inactive", userEmail);
+  };
+
+  // Trigger modal confirmation
+  const handleInitiatePasswordReset = (userId: string, targetEmail: string) => {
+    setPendingPasswordReset({ userId, userEmail: targetEmail });
+    setResetCountdown(5);
+  };
+
+  // Perform password reset via API
+  const handleConfirmPasswordReset = async () => {
+    if (!pendingPasswordReset || resetCountdown > 0) return;
+    const { userId, userEmail } = pendingPasswordReset;
+    const defaultPassword = "malayan@2026";
+    
+    setPendingPasswordReset(null);
+    setLoadingMessage(`Resetting password for ${userEmail}...`);
+    setIsProcessing(true);
 
     try {
       const { data: sessionData } = await supabase.auth.getUser();
@@ -209,24 +278,29 @@ export default function AdminUsersPage() {
           userId,
           newPassword: defaultPassword,
           adminEmail,
-          targetEmail,
+          targetEmail: userEmail,
         }),
       });
 
       const data = await response.json();
-
       if (!response.ok) throw new Error(data.error);
 
-      alert(
-        `Success! Password for ${targetEmail} has been reset to: ${defaultPassword}`,
-      );
+      setHasCopiedPassword(false);
+      setResetSuccessInfo({ email: userEmail, tempPass: defaultPassword });
     } catch (error: any) {
       console.error("Failed to reset password:", error);
-      alert(`Error resetting password: ${error.message}`);
+    } finally {
+      setIsProcessing(false);
     }
   };
 
-  // Block rendering until permissions resolve
+  const handleCopyPassword = () => {
+    if (!resetSuccessInfo) return;
+    navigator.clipboard.writeText(resetSuccessInfo.tempPass);
+    setHasCopiedPassword(true);
+    setTimeout(() => setHasCopiedPassword(false), 2000);
+  };
+
   if (isPermissionsLoading || !manageUsers) {
     return <div className="p-12 text-center text-slate-500 font-bold mt-20">Verifying security clearance...</div>;
   }
@@ -401,14 +475,16 @@ export default function AdminUsersPage() {
                     </td>
                     <td className="p-4 text-right space-x-4 whitespace-nowrap">
                       <button
-                        onClick={() => handleResetPassword(user.id, user.email)}
-                        className="text-xs font-bold text-blue-600 hover:underline"
+                        onClick={() => handleInitiatePasswordReset(user.id, user.email)}
+                        disabled={isProcessing}
+                        className="text-xs font-bold text-blue-600 hover:underline disabled:opacity-50"
                       >
                         Reset Pass
                       </button>
                       <button
-                        onClick={() => handleToggleStatus(user.id, user.status, user.email)}
-                        className={`text-xs font-bold hover:underline ${user.status === "Active" ? "text-rose-600" : "text-emerald-600"}`}
+                        onClick={() => handleInitiateStatusChange(user.id, user.status, user.email)}
+                        disabled={isProcessing}
+                        className={`text-xs font-bold hover:underline disabled:opacity-50 ${user.status === "Active" ? "text-rose-600" : "text-emerald-600"}`}
                       >
                         {user.status === "Active" ? "Deactivate" : "Activate"}
                       </button>
@@ -438,6 +514,130 @@ export default function AdminUsersPage() {
           </div>
         </div>
       </div>
+
+      {/* Mandatory Deactivation Confirmation Modal with 5s Timer */}
+      {pendingDeactivation && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6 border border-slate-200 text-center">
+            <div className="w-12 h-12 rounded-full bg-rose-100 text-rose-600 flex items-center justify-center mx-auto mb-4">
+              <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+            </div>
+            
+            <h3 className="text-lg font-bold text-slate-800 mb-2">Deactivate Account?</h3>
+            <p className="text-sm text-slate-600 font-bold mb-4">
+              Are you sure you want to deactivate <span className="text-slate-900 font-extrabold">{pendingDeactivation.userEmail}</span>?
+            </p>
+            <p className="text-xs text-rose-600 font-bold bg-rose-50 border border-rose-200 rounded-lg p-3 mb-6 text-left">
+              Deactivated users are immediately barred from signing in, submitting assessments, and accessing learning materials.
+            </p>
+
+            <div className="flex gap-3 justify-end">
+              <button
+                type="button"
+                onClick={() => setPendingDeactivation(null)}
+                className="px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-bold rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDeactivation}
+                disabled={deactivateCountdown > 0}
+                className="min-w-[170px] px-5 py-2.5 bg-rose-600 hover:bg-rose-700 disabled:bg-rose-300 text-white text-sm font-bold rounded-lg transition-colors shadow-sm disabled:cursor-not-allowed"
+              >
+                {deactivateCountdown > 0 ? `Confirm in ${deactivateCountdown}s` : "Confirm Deactivation"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Mandatory Password Reset Confirmation Modal with 5s Timer */}
+      {pendingPasswordReset && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6 border border-slate-200 text-center">
+            <div className="w-12 h-12 rounded-full bg-amber-100 text-amber-600 flex items-center justify-center mx-auto mb-4">
+              <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+              </svg>
+            </div>
+            
+            <h3 className="text-lg font-bold text-slate-800 mb-2">Reset Account Password?</h3>
+            <p className="text-sm text-slate-600 font-bold mb-4">
+              Reset login credentials for <span className="text-slate-900 font-extrabold">{pendingPasswordReset.userEmail}</span>?
+            </p>
+            <p className="text-xs text-amber-800 font-bold bg-amber-50 border border-amber-200 rounded-lg p-3 mb-6 text-left">
+              The user’s current password will be invalidated and replaced with the system standard temporary password (<code className="font-mono font-black text-amber-950">malayan@2026</code>).
+            </p>
+
+            <div className="flex gap-3 justify-end">
+              <button
+                type="button"
+                onClick={() => setPendingPasswordReset(null)}
+                className="px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-bold rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmPasswordReset}
+                disabled={resetCountdown > 0}
+                className="min-w-[170px] px-5 py-2.5 bg-amber-600 hover:bg-amber-700 disabled:bg-amber-300 text-white text-sm font-bold rounded-lg transition-colors shadow-sm disabled:cursor-not-allowed"
+              >
+                {resetCountdown > 0 ? `Confirm in ${resetCountdown}s` : "Confirm Password Reset"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Password Reset Success Modal */}
+      {resetSuccessInfo && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6 border border-slate-200 text-center">
+            <div className="w-12 h-12 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center mx-auto mb-4">
+              <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              </svg>
+            </div>
+            
+            <h3 className="text-lg font-bold text-slate-800 mb-2">Password Reset Successful</h3>
+            <p className="text-sm text-slate-600 font-bold mb-4">
+              Credentials for <span className="text-slate-900 font-extrabold">{resetSuccessInfo.email}</span> have been reset.
+            </p>
+
+            <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 mb-6 flex items-center justify-between">
+              <div className="text-left">
+                <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider block">Temporary Password</span>
+                <span className="font-mono text-base font-black text-slate-800">{resetSuccessInfo.tempPass}</span>
+              </div>
+              <button
+                type="button"
+                onClick={handleCopyPassword}
+                className="px-3 py-1.5 bg-white border border-slate-200 hover:bg-slate-100 text-xs font-bold text-slate-700 rounded-lg shadow-sm transition-colors"
+              >
+                {hasCopiedPassword ? "Copied! ✓" : "Copy"}
+              </button>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setResetSuccessInfo(null)}
+              className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold rounded-lg transition-colors shadow-sm"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* FullScreenLoader Component */}
+      <FullScreenLoader 
+        isOpen={isLoading || isProcessing} 
+        message={loadingMessage} 
+      />
     </div>
   );
 }

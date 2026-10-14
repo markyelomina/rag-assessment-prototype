@@ -1,5 +1,6 @@
 'use client';
 
+import FullScreenLoader from '@/components/ui/FullScreenLoader';
 import React, { useState, useEffect } from 'react';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } from 'recharts';
 import { supabase } from '@/lib/supabaseClient';
@@ -604,6 +605,10 @@ export default function FacultyAnalyticsPage() {
           </div>
         </>
       )}
+      <FullScreenLoader 
+        isOpen={isLoading || isExporting} 
+        message={isLoading? "Loading analytics and grades..." : "Exporting cohort grades..."} 
+      />
     </div>
   );
 }

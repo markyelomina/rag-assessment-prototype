@@ -1,13 +1,21 @@
 'use client';
 
-import React, { useState, useEffect, Suspense } from 'react';
-import { useRouter } from 'next/navigation';
+import FullScreenLoader from '@/components/ui/FullScreenLoader';
+import React, { useState, useEffect, useMemo, Suspense } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { useDebounce } from '@/hooks/useDebounce';
 import { usePagination } from '@/hooks/usePagination';
 import { supabase } from '@/lib/supabaseClient';
 import { useToast } from '@/components/ui/ToastContext';
 import { useRegeneration } from '@/hooks/useRegeneration';
-import { useSearchParams } from 'next/navigation';
+import {
+  calculateItemAnalysis,
+  calculateTOSScoring,
+  calculateKR20Reliability,
+  ItemAnalysisResult,
+  StudentAttemptScore,
+  QuestionDefinition
+} from '@/lib/psychometrics';
 
 // --- Types ---
 interface FacultyExam {
@@ -44,6 +52,7 @@ interface ValidationItem {
 interface StudentReviewItem {
   qNum: number;
   text: string;
+  topic: string;
   options: string[];
   studentAnswer: string;
   correctAnswer: string;
@@ -56,9 +65,11 @@ interface AttemptRecord {
   score: number;
   rawScore: number;
   maxScore: number;
+  scorePercentage: number;
   status: string;
   takenAt: string;
   items: StudentReviewItem[];
+  weakCompetencies: { topic: string; accuracy: number }[];
 }
 
 interface SelectedStudentReview {
@@ -66,7 +77,7 @@ interface SelectedStudentReview {
   attempts: AttemptRecord[];
 }
 
-// --- Helper Functions ---
+// --- Helpers ---
 const formatCitations = (rawCitations: any): string => {
   if (!rawCitations) return 'No citation provided';
 
@@ -149,12 +160,30 @@ const formatAttemptDate = (isoString: string) => {
   return `${dateStr}, ${timeStr}`;
 };
 
+const parseOptionsArray = (raw: any): string[] => {
+  if (!raw) return ['Option A', 'Option B', 'Option C', 'Option D'];
+  let parsed = raw;
+  try {
+    while (typeof parsed === 'string') parsed = JSON.parse(parsed);
+  } catch (e) {
+    // raw was already plain text or array
+  }
+  if (Array.isArray(parsed)) {
+    return parsed.map(opt => String(opt));
+  }
+  if (typeof parsed === 'object' && parsed !== null) {
+    return Object.values(parsed).map(opt => String(opt));
+  }
+  return [String(raw)];
+};
+
 function FacultyExamsContent() {
   const router = useRouter();
   const { addToast } = useToast();
   const searchParams = useSearchParams();
+  const [isNavigating, setIsNavigating] = useState(false);
 
-  const { regenerateItem, status: regenStatus, progressDetails: regenProgress } = useRegeneration();
+  const { regenerateItem, checkRegenerationHeartbeat, status: regenStatus, progressDetails: regenProgress } = useRegeneration();
 
   const [selectedExam, setSelectedExam] = useState<null | string>(null);
   const [examTab, setExamTab] = useState('settings');
@@ -167,11 +196,21 @@ function FacultyExamsContent() {
   const [studentSearch, setStudentSearch] = useState('');
   const debouncedStudentSearch = useDebounce(studentSearch, 300);
   const [studentStatusFilter, setStudentStatusFilter] = useState('All');
+  const [studentCohortFilter, setStudentCohortFilter] = useState('All');
+
+  // Question Analytics Filters & Collapsible Details
+  const [analyticsCohortFilter, setAnalyticsCohortFilter] = useState('All');
+  const [analyticsAttemptBasis, setAnalyticsAttemptBasis] = useState<'graded' | 'first' | 'all'>('graded');
+  const [expandedQuestionDetails, setExpandedQuestionDetails] = useState<Record<string, boolean>>({});
+
+  const toggleQuestionDetails = (id: string) => {
+    setExpandedQuestionDetails(prev => ({ ...prev, [id]: !prev[id] }));
+  };
 
   const [selectedQuestions, setSelectedQuestions] = useState<string[]>([]);
   const [regeneratingItems, setRegeneratingItems] = useState<string[]>([]);
 
-  const [teacherCohorts, setTeacherCohorts] = useState<{id: string, name: string}[]>([]);
+  const [teacherCohorts, setTeacherCohorts] = useState<{ id: string; name: string }[]>([]);
   const [editSelectedCohorts, setEditSelectedCohorts] = useState<string[]>([]);
   const [isCohortDropdownOpen, setIsCohortDropdownOpen] = useState(false);
 
@@ -198,13 +237,29 @@ function FacultyExamsContent() {
   const [exams, setExams] = useState<FacultyExam[]>([]);
   const [aiQuestions, setAiQuestions] = useState<ValidationItem[]>([]);
 
+  // Analytics States
   const [studentAnalytics, setStudentAnalytics] = useState<any[]>([]);
   const [isFetchingAnalytics, setIsFetchingAnalytics] = useState(false);
   const [questionAnalytics, setQuestionAnalytics] = useState<any[]>([]);
+  const [kr20Reliability, setKr20Reliability] = useState<number | null>(null);
+
+  // Competency Filters
+  const [selectedCompetencyFilter, setSelectedCompetencyFilter] = useState<string>('All');
+
+  const handleBackToExams = () => {
+    setSelectedExam(null);
+    setSelectedQuestions([]);
+    setSelectedStudentForReview(null);
+    setHasAcknowledgedVoidWarning(false);
+    setSelectedCompetencyFilter('All');
+    setAnalyticsCohortFilter('All');
+    router.replace('/faculty/exams');
+  };
 
   useEffect(() => {
     const passedExamId = searchParams.get('examId');
     const passedView = searchParams.get('view');
+    const passedCohortId = searchParams.get('cohortId');
 
     if (passedExamId) {
       setSelectedExam(passedExamId);
@@ -217,7 +272,22 @@ function FacultyExamsContent() {
         setExamTab('settings');
       }
     }
+
+    if (passedCohortId) {
+      setStudentCohortFilter(passedCohortId);
+      setAnalyticsCohortFilter(passedCohortId);
+    }
   }, [searchParams]);
+
+  // Auto-populate editSelectedCohorts when navigating directly via URL query param
+  useEffect(() => {
+    if (selectedExam && exams.length > 0) {
+      const current = exams.find(e => e.id === selectedExam);
+      if (current && editSelectedCohorts.length === 0 && current.cohortIds?.length > 0) {
+        setEditSelectedCohorts(current.cohortIds);
+      }
+    }
+  }, [selectedExam, exams, editSelectedCohorts.length]);
 
   useEffect(() => {
     const fetchFacultyExams = async () => {
@@ -358,6 +428,15 @@ function FacultyExamsContent() {
     fetchExamQuestions();
   }, [fetchExamQuestions]);
 
+  const availableCompetencies = useMemo(() => {
+    const set = new Set<string>();
+    aiQuestions.forEach(q => {
+      if (q.topic) set.add(q.topic);
+    });
+    return Array.from(set);
+  }, [aiQuestions]);
+
+  // Fetch Gradebook Analytics
   useEffect(() => {
     const fetchAnalytics = async () => {
       if (!selectedExam || examTab !== 'gradebook') return;
@@ -367,53 +446,118 @@ function FacultyExamsContent() {
       const gradingRule = currentExamConfig?.gradingLogic || 'highest';
       const totalItems = currentExamConfig?.items || 0;
 
+      // 1. Fetch Exam Cohorts & Students
       const { data: ecData } = await supabase.from('Exam_Cohorts').select('cohort_id').eq('exam_id', selectedExam);
       const cohortIds = ecData?.map(ec => ec.cohort_id) || [];
 
       let students: any[] = [];
       if (cohortIds.length > 0) {
-        const { data: studentData } = await supabase.from('Users').select('user_id, name').in('cohort_id', cohortIds);
+        const { data: studentData } = await supabase
+          .from('Users')
+          .select('user_id, name, cohort_id')
+          .in('cohort_id', cohortIds);
         students = studentData || [];
       }
 
+      // 2. Fetch Exam Items
+      const { data: rawItems } = await supabase
+        .from('Mock Exam Items')
+        .select('id, subject, competency, correct_answer, options')
+        .eq('exam_session_id', selectedExam);
+
+      const questionDefs: QuestionDefinition[] = (rawItems || []).map(q => ({
+        id: q.id,
+        subject: q.subject || currentExamConfig?.target || 'General Scope',
+        competency: q.competency || 'General Competency',
+        options: Array.isArray(q.options) ? q.options : [],
+        correctAnswer: q.correct_answer || ''
+      }));
+
+      // 3. Fetch Student Attempts and Answers
       const { data: attemptsData } = await supabase
         .from('Student Attempts')
         .select('*')
         .eq('exam_id', selectedExam)
-        .order('completed_at', { ascending: true }); // Earliest first
+        .order('completed_at', { ascending: true });
 
+      const attemptIds = (attemptsData || []).map(a => a.attempt_id);
+      let answersData: any[] = [];
+      if (attemptIds.length > 0) {
+        const { data: ans } = await supabase
+          .from('Student Answers')
+          .select('attempt_id, question_id, is_correct, selected_option')
+          .in('attempt_id', attemptIds);
+        answersData = ans || [];
+      }
+
+      // 4. Merge Student Data
       const mergedData = students.map(st => {
-        const studentAttempts = attemptsData?.filter(a => a.student_id === st.user_id) || [];
-        const isCompleted = studentAttempts.length > 0 && studentAttempts.some(a => a.exam_status?.toLowerCase() === 'completed');
+        const studentAttempts = (attemptsData || []).filter(a => a.student_id === st.user_id);
+        const completedAttempts = studentAttempts.filter(a => a.exam_status?.toLowerCase() === 'completed');
+        const isCompleted = completedAttempts.length > 0;
 
-        let calculatedFinalGrade: number | string = 'Pending';
-        let calculatedRawScore: number | string = 'Pending';
+        let calculatedGradeDisplay: string = 'Pending';
+        let calculatedRawScore = 0;
+        let calculatedPercentage = 0;
 
-        if (studentAttempts.length > 0) {
-           const scores = studentAttempts.map(a => a.final_score || 0);
-           if (gradingRule === 'highest') calculatedFinalGrade = Math.max(...scores);
-           else if (gradingRule === 'latest') calculatedFinalGrade = scores[scores.length - 1];
-           else if (gradingRule === 'average') calculatedFinalGrade = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
-           
-           // Derive raw score from the final percentage grade stored in DB
-           calculatedRawScore = Math.round((Number(calculatedFinalGrade) / 100) * totalItems);
+        const attemptsToEvaluate = completedAttempts.length > 0 ? completedAttempts : studentAttempts;
+
+        if (attemptsToEvaluate.length > 0) {
+          const attemptEvaluations = attemptsToEvaluate.map(att => {
+            const attAnswers = (answersData || [])
+              .filter(ans => ans.attempt_id === att.attempt_id)
+              .map(ans => ({
+                questionId: ans.question_id,
+                isCorrect: ans.is_correct
+              }));
+
+            const tosResult = calculateTOSScoring(questionDefs, attAnswers);
+            return {
+              rawScore: tosResult.rawScore,
+              percentage: tosResult.rawPercentage
+            };
+          });
+
+          if (gradingRule === 'highest') {
+            const best = attemptEvaluations.reduce((prev, curr) => 
+              curr.percentage > prev.percentage ? curr : prev, 
+              attemptEvaluations[0]
+            );
+            calculatedRawScore = best.rawScore;
+            calculatedPercentage = best.percentage;
+          } else if (gradingRule === 'latest') {
+            const latest = attemptEvaluations[attemptEvaluations.length - 1];
+            calculatedRawScore = latest.rawScore;
+            calculatedPercentage = latest.percentage;
+          } else if (gradingRule === 'average') {
+            const avgRaw = Math.round(attemptEvaluations.reduce((acc, curr) => acc + curr.rawScore, 0) / attemptEvaluations.length);
+            const avgPct = Math.round(attemptEvaluations.reduce((acc, curr) => acc + curr.percentage, 0) / attemptEvaluations.length);
+            calculatedRawScore = avgRaw;
+            calculatedPercentage = avgPct;
+          }
+          calculatedGradeDisplay = `${calculatedRawScore} / ${totalItems} (${calculatedPercentage}%)`;
         }
 
         return {
           id: st.user_id,
           name: st.name,
+          cohortId: st.cohort_id,
           status: studentAttempts.length > 0 ? (isCompleted ? 'Completed' : 'In Progress') : 'Not Taken',
           attempts: studentAttempts,
-          grade: calculatedFinalGrade === 'Pending' ? 'Pending' : `${calculatedRawScore} / ${totalItems}`
+          rawScore: calculatedRawScore,
+          percentage: calculatedPercentage,
+          grade: calculatedGradeDisplay
         };
       });
 
       setStudentAnalytics(mergedData);
       setIsFetchingAnalytics(false);
     };
-    fetchAnalytics();
-  }, [selectedExam, examTab, exams]);
 
+    fetchAnalytics();
+  }, [selectedExam, examTab]);
+
+  // Fetch Question Analytics with Cohort Filter
   useEffect(() => {
     const fetchQuestionAnalytics = async () => {
       if (!selectedExam || examTab !== 'question_analytics') return;
@@ -421,7 +565,7 @@ function FacultyExamsContent() {
 
       const { data: questions } = await supabase
         .from('Mock Exam Items')
-        .select('id, question, options, correct_answer')
+        .select('*')
         .eq('exam_session_id', selectedExam);
 
       if (!questions || questions.length === 0) {
@@ -430,15 +574,105 @@ function FacultyExamsContent() {
         return;
       }
 
-      const questionIds = questions.map(q => q.id);
-      const { data: answers } = await supabase
-        .from('Student Answers')
-        .select('question_id, selected_option')
-        .in('question_id', questionIds);
+      // Filter by cohort if selected
+      let cohortStudentIds: string[] | null = null;
+      if (analyticsCohortFilter !== 'All') {
+        const { data: cStudents } = await supabase
+          .from('Users')
+          .select('user_id')
+          .eq('cohort_id', analyticsCohortFilter);
+        cohortStudentIds = (cStudents || []).map(s => s.user_id);
+      }
 
-      const safeAnswers = answers || [];
+      let attemptsQuery = supabase
+        .from('Student Attempts')
+        .select('attempt_id, student_id, final_score, exam_status')
+        .eq('exam_id', selectedExam);
 
-      const analytics = questions.map(q => {
+      if (cohortStudentIds !== null) {
+        if (cohortStudentIds.length === 0) {
+          setQuestionAnalytics([]);
+          setIsFetchingAnalytics(false);
+          return;
+        }
+        attemptsQuery = attemptsQuery.in('student_id', cohortStudentIds);
+      }
+
+      const { data: attempts } = await attemptsQuery;
+
+      // Filter attempts case-insensitively in JavaScript
+      const allAttempts = attempts || [];
+      const completedAttempts = allAttempts.filter(
+        a => a.exam_status?.toLowerCase() === 'completed'
+      );
+      // Fallback to all recorded attempts if none are explicitly tagged 'Completed'
+      const safeAttempts = completedAttempts.length > 0 ? completedAttempts : allAttempts;
+      const attemptIds = safeAttempts.map(a => a.attempt_id);
+
+      let safeAnswers: any[] = [];
+      if (attemptIds.length > 0) {
+        const { data: answers } = await supabase
+          .from('Student Answers')
+          .select('attempt_id, question_id, selected_option, is_correct')
+          .in('attempt_id', attemptIds);
+        safeAnswers = answers || [];
+      }
+
+      // Group attempts by student
+      const gradingRule = currentExam?.gradingLogic || 'highest';
+      const studentAttemptsGrouped: Record<string, any[]> = {};
+      
+      safeAttempts.forEach(att => {
+        if (!studentAttemptsGrouped[att.student_id]) {
+          studentAttemptsGrouped[att.student_id] = [];
+        }
+        studentAttemptsGrouped[att.student_id].push(att);
+      });
+
+      // Filter attempts based on analyticsAttemptBasis
+      const qualifyingAttempts: any[] = [];
+      if (analyticsAttemptBasis === 'all') {
+        qualifyingAttempts.push(...safeAttempts);
+      } else {
+        Object.values(studentAttemptsGrouped).forEach(attemptsList => {
+          if (analyticsAttemptBasis === 'first') {
+            qualifyingAttempts.push(attemptsList[0]);
+          } else {
+            // 'graded' mode: uses the exam's grading logic
+            if (gradingRule === 'highest') {
+              const best = attemptsList.reduce((prev, curr) => 
+                (curr.final_score || 0) > (prev.final_score || 0) ? curr : prev, attemptsList[0]
+              );
+              qualifyingAttempts.push(best);
+            } else {
+              qualifyingAttempts.push(attemptsList[attemptsList.length - 1]);
+            }
+          }
+        });
+      }
+
+      const attemptScoreMap: Record<string, StudentAttemptScore> = {};
+      qualifyingAttempts.forEach(att => {
+        attemptScoreMap[att.attempt_id] = {
+          studentId: att.student_id,
+          totalScore: att.final_score || 0,
+          answers: []
+        };
+      });
+
+      safeAnswers.forEach(ans => {
+        if (attemptScoreMap[ans.attempt_id]) {
+          attemptScoreMap[ans.attempt_id].answers.push({
+            questionId: ans.question_id,
+            selectedOption: ans.selected_option || '',
+            isCorrect: ans.is_correct || false
+          });
+        }
+      });
+
+      const attemptScoresList = Object.values(attemptScoreMap);
+
+      const analyticsResults = questions.map((q) => {
         let parsedOptions: string[] = [];
         let mappedCorrectAnswer = String(q.correct_answer || '').trim();
 
@@ -461,28 +695,63 @@ function FacultyExamsContent() {
           parsedOptions = [];
         }
 
-        const qAnswers = safeAnswers.filter(a => a.question_id === q.id);
-        const totalAnswers = qAnswers.length;
+        const qDef: QuestionDefinition = {
+          id: q.id,
+          subject: q.subject || 'General Scope',
+          competency: q.competency || 'General Competency',
+          options: parsedOptions,
+          correctAnswer: mappedCorrectAnswer
+        };
 
-        const optionsStats = parsedOptions.map((opt: string) => {
-          const count = qAnswers.filter(a => normalizeForComparison(a.selected_option) === normalizeForComparison(opt)).length;
-          const percent = totalAnswers > 0 ? Math.round((count / totalAnswers) * 100) : 0;
+        const ctt: ItemAnalysisResult = calculateItemAnalysis(qDef, attemptScoresList);
+
+          // Fallback ensures options are never empty even if examinees = 0
+          const resolvedOptions = (ctt.distractors && ctt.distractors.length > 0)
+            ? ctt.distractors.map(d => ({
+                text: d.optionText,
+                count: d.count,
+                percent: Math.round(d.selectionRate * 100),
+                isCorrect: d.isCorrect,
+                isNonFunctional: d.isNonFunctional
+              }))
+            : parsedOptions.map(opt => ({
+                text: opt,
+                count: 0,
+                percent: 0,
+                isCorrect: normalizeForComparison(opt) === normalizeForComparison(mappedCorrectAnswer),
+                isNonFunctional: false
+              }));
+
           return {
-            text: opt,
-            count,
-            percent,
-            isCorrect: normalizeForComparison(opt) === normalizeForComparison(mappedCorrectAnswer)
+            id: q.id,
+            question: q.question,
+            topic: q.competency || q.subject || 'General Scope',
+            options: resolvedOptions,
+            totalAnswers: attemptScoresList.length,
+            facilityIndex: ctt.facilityIndex,
+            discriminationIndex: ctt.discriminationIndex,
+            facilityLabel: ctt.facilityLabel,
+            discriminationLabel: ctt.discriminationLabel,
+            status: ctt.status,
+            statusMessage: ctt.statusMessage
           };
-        });
-
-        return { id: q.id, question: q.question, options: optionsStats, totalAnswers };
       });
 
-      setQuestionAnalytics(analytics);
+      if (attemptScoresList.length >= 4 && questions.length > 1) {
+        const itemFacilities = analyticsResults.map(r => r.facilityIndex);
+        const studentTotals = attemptScoresList.map(a => a.totalScore);
+        const kr20 = calculateKR20Reliability(questions.length, itemFacilities, studentTotals);
+        setKr20Reliability(kr20);
+      } else {
+        setKr20Reliability(null);
+      }
+
+      setQuestionAnalytics(analyticsResults);
       setIsFetchingAnalytics(false);
     };
+
     fetchQuestionAnalytics();
-  }, [selectedExam, examTab]);
+  }, [selectedExam, examTab, analyticsCohortFilter, analyticsAttemptBasis]);
 
   const currentExam = exams.find(e => e.id === selectedExam);
   
@@ -493,22 +762,58 @@ function FacultyExamsContent() {
   const pendingQuestions = aiQuestions.filter(q => q.status === 'PASSED' || q.status === 'FLAGGED_FOR_MANUAL_REVIEW');
   const approvedQuestions = aiQuestions.filter(q => q.status === 'APPROVED');
   
-  const visibleQuestions = isValidationMode 
-    ? (validationTab === 'pending' ? pendingQuestions : approvedQuestions) 
-    : aiQuestions;
+  const visibleQuestions = useMemo(() => {
+    let list = isValidationMode 
+      ? (validationTab === 'pending' ? pendingQuestions : approvedQuestions) 
+      : aiQuestions;
 
-  const handleExamClick = (exam: FacultyExam) => {
+    if (selectedCompetencyFilter !== 'All') {
+      list = list.filter(q => q.topic === selectedCompetencyFilter);
+    }
+    return list;
+  }, [isValidationMode, validationTab, pendingQuestions, approvedQuestions, aiQuestions, selectedCompetencyFilter]);
+
+  const filteredQuestionAnalytics = useMemo(() => {
+    if (selectedCompetencyFilter === 'All') return questionAnalytics;
+    return questionAnalytics.filter(qa => qa.topic === selectedCompetencyFilter);
+  }, [questionAnalytics, selectedCompetencyFilter]);
+
+  const handleOpenSettings = (exam: FacultyExam) => {
     if (exam.status === 'Generating') return;
     setSelectedExam(exam.id);
     setSelectedStudentForReview(null);
     setHasAcknowledgedVoidWarning(false);
-    
     setEditSelectedCohorts(exam.cohortIds || []);
     setIsCohortDropdownOpen(false);
+    setSelectedCompetencyFilter('All');
+    setExamTab('settings');
+  };
 
-    if (exam.status === 'Pending') setExamTab('questions');
-    else if (exam.status === 'Inactive') setExamTab('question_analytics');
-    else setExamTab('settings');
+  const handleOpenQuestionsOrResults = (exam: FacultyExam) => {
+    if (exam.status === 'Generating') return;
+    setSelectedExam(exam.id);
+    setSelectedStudentForReview(null);
+    setHasAcknowledgedVoidWarning(false);
+    setEditSelectedCohorts(exam.cohortIds || []);
+    setIsCohortDropdownOpen(false);
+    setSelectedCompetencyFilter('All');
+
+    if (exam.status === 'Inactive') {
+      setExamTab('question_analytics');
+    } else {
+      setExamTab('questions');
+    }
+  };
+
+  const handleOpenGradebook = (exam: FacultyExam) => {
+    if (exam.status === 'Generating' || exam.status === 'Pending') return;
+    setSelectedExam(exam.id);
+    setSelectedStudentForReview(null);
+    setHasAcknowledgedVoidWarning(false);
+    setEditSelectedCohorts(exam.cohortIds || []);
+    setIsCohortDropdownOpen(false);
+    setSelectedCompetencyFilter('All');
+    setExamTab('gradebook');
   };
 
   const handleSaveSettings = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -559,39 +864,6 @@ function FacultyExamsContent() {
       await supabase.from('Exam_Cohorts').insert(cohortPayload);
     }
 
-    // ---> NEW: Log the exam update to AuditLogs
-    const { data: { user } } = await supabase.auth.getUser();
-    if (user) {
-      const { data: userData } = await supabase
-        .from('Users')
-        .select(`email, Roles ( role_name )`)
-        .eq('user_id', user.id)
-        .single();
-
-      const userEmail = userData?.email || user.email || 'System';
-      
-      let roleName = 'Teacher';
-      if (userData?.Roles) {
-        if (Array.isArray(userData.Roles) && userData.Roles.length > 0) {
-          roleName = (userData.Roles[0] as any).role_name || 'Teacher';
-        } else if (!Array.isArray(userData.Roles)) {
-          roleName = (userData.Roles as any).role_name || 'Teacher';
-        }
-      }
-
-      await supabase.from('AuditLogs').insert([
-        {
-          user_email: userEmail,
-          role: roleName,
-          action: `Updated settings and assigned cohorts for exam: "${title}"`,
-          type: 'User Activity',
-          severity: 'Info',
-          ip_address: 'Internal',
-          user_agent: navigator.userAgent
-        }
-      ]);
-    }
-
     const newStartDateStr = scheduleStartUTC ? new Date(scheduleStartUTC).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date';
     const newEndDateStr = scheduleEndUTC ? new Date(scheduleEndUTC).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'No Date';
     const mappedCohortNames = teacherCohorts.filter(c => editSelectedCohorts.includes(c.id)).map(c => c.name);
@@ -620,15 +892,18 @@ function FacultyExamsContent() {
       addToast('No analytics data to export.', 'error');
       return;
     }
-    const headers = ['Student Name', 'Status', 'Latest Date Taken', 'Final Grade'];
+    const headers = ['Student Name', 'Cohort', 'Status', 'Score (%)', 'Attempts', 'Latest Date Taken'];
     const rows = filteredStudents.map(s => {
+      const cohortName = teacherCohorts.find(c => c.id === s.cohortId)?.name || 'General';
       const latestAttempt = s.attempts && s.attempts.length > 0 ? s.attempts[s.attempts.length - 1] : null;
       const dateTaken = latestAttempt?.completed_at ? new Date(latestAttempt.completed_at).toLocaleString() : 'Pending';
       return [
         `"${s.name}"`,
+        `"${cohortName}"`,
         `"${s.status}"`,
-        `"${dateTaken}"`,
-        `"${s.grade}"`
+        `"${s.grade}"`,
+        `"${s.attempts?.length || 0}"`,
+        `"${dateTaken}"`
       ];
     });
     const csvContent = [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
@@ -639,6 +914,7 @@ function FacultyExamsContent() {
     link.click();
   };
 
+  // Detailed Student Attempt Review Modal
   const handleViewStudent = async (student: any) => {
     setIsLoadingReview(true);
 
@@ -648,15 +924,29 @@ function FacultyExamsContent() {
       return;
     }
 
+    const { data: rawItems } = await supabase
+      .from('Mock Exam Items')
+      .select('id, subject, competency, correct_answer, options, question, rationale')
+      .eq('exam_session_id', selectedExam);
+
+    const questionDefs: QuestionDefinition[] = (rawItems || []).map(q => ({
+      id: q.id,
+      subject: q.subject || currentExam?.target || 'General Scope',
+      competency: q.competency || 'General Competency',
+      options: Array.isArray(q.options) ? q.options : [],
+      correctAnswer: q.correct_answer || ''
+    }));
+
     const formattedAttempts: AttemptRecord[] = await Promise.all(
       student.attempts.map(async (attempt: any) => {
         const { data: answersData } = await supabase
           .from("Student Answers")
           .select(`
+            question_id,
             selected_option,
             is_correct,
             rag_feedback,
-            "Mock Exam Items" ( question, correct_answer, rationale, options )
+            "Mock Exam Items" ( question, competency, correct_answer, rationale, options )
           `)
           .eq("attempt_id", attempt.attempt_id);
 
@@ -690,6 +980,7 @@ function FacultyExamsContent() {
           return {
             qNum: idx + 1,
             text: mockItem?.question || "Question data unavailable",
+            topic: mockItem?.competency || "General Competency",
             studentAnswer: cleanStudentAnswer,
             correctAnswer: cleanCorrectAnswer,
             isCorrect: ans.is_correct,
@@ -698,23 +989,49 @@ function FacultyExamsContent() {
           };
         });
 
+        const ansList = (answersData || []).map(a => ({ questionId: a.question_id, isCorrect: a.is_correct }));
+        const tosResult = calculateTOSScoring(questionDefs, ansList);
+
+        const weakList = Object.values(tosResult.competencyBreakdown)
+          .filter(c => c.needsRemediation)
+          .map(c => ({ topic: c.competency, accuracy: c.accuracy }));
+
+        const rawScore = items.filter(i => i.isCorrect).length;
+        const maxScore = items.length;
+        const scorePercentage = maxScore > 0 ? Math.round((rawScore / maxScore) * 100) : 0;
+
         return {
           attemptId: attempt.attempt_id,
           score: attempt.final_score || 0,
-          rawScore: items.filter(i => i.isCorrect).length,
-          maxScore: items.length,
+          rawScore,
+          maxScore,
+          scorePercentage,
           status: attempt.exam_status,
           takenAt: attempt.completed_at,
           items: items,
+          weakCompetencies: weakList
         };
       })
     );
+
+    const gradingRule = currentExam?.gradingLogic || 'highest';
+    let defaultIndex = Math.max(0, formattedAttempts.length - 1);
+
+    if (gradingRule === 'highest' && formattedAttempts.length > 0) {
+      let highestScore = -1;
+      formattedAttempts.forEach((att, idx) => {
+        if (att.scorePercentage > highestScore) {
+          highestScore = att.scorePercentage;
+          defaultIndex = idx;
+        }
+      });
+    }
 
     setSelectedStudentForReview({
       name: student.name,
       attempts: formattedAttempts
     });
-    setActiveAttemptIndex(formattedAttempts.length > 0 ? formattedAttempts.length - 1 : 0);
+    setActiveAttemptIndex(defaultIndex);
     setIsLoadingReview(false);
   };
 
@@ -724,12 +1041,6 @@ function FacultyExamsContent() {
     if (status === 'Pending') return <span className="shrink-0 px-2 py-1 bg-amber-100 text-amber-800 rounded text-[10px] font-bold uppercase tracking-wider">{status}</span>;
     if (status === 'Hidden') return <span className="shrink-0 px-2 py-1 bg-slate-200 text-slate-700 rounded text-[10px] font-bold uppercase tracking-wider">{status}</span>;
     return <span className="shrink-0 px-2 py-1 bg-slate-100 text-slate-600 rounded text-[10px] font-bold uppercase tracking-wider">{status}</span>;
-  };
-
-  const getActionLabel = (status: string) => {
-    if (status === 'Pending') return 'Review Questions';
-    if (status === 'Inactive') return 'View Results';
-    return 'Manage Exam';
   };
 
   const getAIStatusStyle = (status: string) => {
@@ -853,9 +1164,17 @@ function FacultyExamsContent() {
     setShowRegenerateModal(true);
   };
 
-  const executeRegeneration = () => {
+  const executeRegeneration = async () => {
     if (!questionToRegenerate || !selectedExam) return;
     setShowRegenerateModal(false);
+
+    // Verify engine and worker availability before triggering
+    const isOnline = await checkRegenerationHeartbeat();
+    if (!isOnline) {
+      addToast('AI Assessment Engine is unreachable. Ensure FastAPI and Celery are running.', 'error');
+      return;
+    }
+
     setRegeneratingItems(prev => [...prev, questionToRegenerate]);
     regenerateItem(questionToRegenerate, selectedExam);
   };
@@ -872,35 +1191,49 @@ function FacultyExamsContent() {
     }
   }, [regenStatus, fetchExamQuestions, regenProgress, addToast]);
 
+  const handleRevokeApproval = async (id: string) => {
+    const { error } = await supabase
+      .from('Mock Exam Items')
+      .update({ status: 'PASSED' })
+      .eq('id', id);
+
+    if (!error) {
+      setAiQuestions(prev => prev.map(q => q.id === id ? { ...q, status: 'PASSED' } : q));
+      addToast('Question moved back to pending review.', 'info');
+    } else {
+      addToast('Failed to revoke approval.', 'error');
+    }
+  };
+
   const handlePullFromVault = async (itemToReplace: ValidationItem) => {
     setRegeneratingItems(prev => [...prev, itemToReplace.id]);
 
+    // Pull approved questions from past assessments with the same competency
     const { data, error } = await supabase
       .from('Mock Exam Items')
       .select('id, question, options, correct_answer, rationale, citations, exam_session_id')
       .eq('status', 'APPROVED')
       .eq('competency', itemToReplace.topic)
+      .neq('id', itemToReplace.id)
+      .neq('exam_session_id', selectedExam)
       .limit(20);
 
     if (error || !data || data.length === 0) {
-      addToast('No matching questions found in the vault for this competency.', 'error');
+      addToast('No other validated questions found in the vault for this competency.', 'error');
       setRegeneratingItems(prev => prev.filter(i => i !== itemToReplace.id));
       return;
     }
 
     const vaultItem = data[Math.floor(Math.random() * data.length)];
-
-    let parsedOptions = [];
-    try { parsedOptions = typeof vaultItem.options === 'string' ? JSON.parse(vaultItem.options) : vaultItem.options; }
-    catch(e) { parsedOptions = [vaultItem.correct_answer, 'Option B', 'Option C', 'Option D']; }
+    const parsedOptions = parseOptionsArray(vaultItem.options);
 
     await supabase.from('Mock Exam Items').update({
-        question: vaultItem.question,
-        options: JSON.stringify(parsedOptions),
-        correct_answer: vaultItem.correct_answer,
-        rationale: vaultItem.rationale || 'Pulled from an archived validated exam.',
-        citations: JSON.stringify(`Historical Exam Resource (Vault Item: ${vaultItem.id.slice(0,8)})`),
-        status: isValidationMode ? 'PASSED' : 'APPROVED'
+      question: vaultItem.question,
+      options: JSON.stringify(parsedOptions),
+      correct_answer: vaultItem.correct_answer,
+      rationale: vaultItem.rationale || 'Pulled from an archived validated exam.',
+      citations: JSON.stringify(`Historical Exam Resource (Vault Item: ${vaultItem.id.slice(0,8)})`),
+      status: isValidationMode ? 'PASSED' : 'APPROVED'
     }).eq('id', itemToReplace.id);
 
     setAiQuestions(prev => prev.map(q => q.id === itemToReplace.id ? {
@@ -926,7 +1259,8 @@ function FacultyExamsContent() {
   const filteredStudents = studentAnalytics.filter(student => {
     const matchesSearch = student.name.toLowerCase().includes(debouncedStudentSearch.toLowerCase());
     const matchesStatus = studentStatusFilter === 'All' || student.status === studentStatusFilter;
-    return matchesSearch && matchesStatus;
+    const matchesCohort = studentCohortFilter === 'All' || student.cohortId === studentCohortFilter;
+    return matchesSearch && matchesStatus && matchesCohort;
   });
 
   const { currentPage: studentPage, totalPages: totalStudentPages, currentItems: currentStudents, nextPage, prevPage, resetPage } = usePagination(filteredStudents, 5);
@@ -940,24 +1274,85 @@ function FacultyExamsContent() {
     setStudentStatusFilter(e.target.value);
     resetPage();
   };
+
+  const getDifficultyBadge = (facility: number, label: string) => {
+    let colorClass = 'bg-rose-100 text-rose-800';
+    if (facility >= 0.70) colorClass = 'bg-blue-100 text-blue-800';
+    else if (facility >= 0.40) colorClass = 'bg-emerald-100 text-emerald-800';
+    else if (facility >= 0.25) colorClass = 'bg-amber-100 text-amber-800';
+
+    return (
+      <div className="relative group/p inline-block cursor-help">
+        <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${colorClass}`}>
+          {label} (P = {facility})
+        </span>
+        <div className="absolute right-0 top-full mt-1.5 hidden group-hover/p:block z-50 w-64 p-3 bg-slate-900 text-white text-[11px] font-normal normal-case rounded-lg shadow-xl pointer-events-none leading-relaxed text-left">
+          <span className="font-bold text-amber-300 block mb-1">Facility Index (P) — Difficulty</span>
+          <p className="text-slate-300 mb-1.5">Percentage of examinees answering correctly.</p>
+          <div className="space-y-0.5 text-[10px]">
+            <div><strong className="text-emerald-400">0.40 – 0.70:</strong> Ideal difficulty (optimal variance)</div>
+            <div><strong className="text-blue-400">&ge; 0.70:</strong> Easy question</div>
+            <div><strong className="text-rose-400">&lt; 0.25:</strong> Hard / Suspect (below chance)</div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const getDiscriminationBadge = (d: number, label: string) => {
+    let colorClass = 'bg-rose-100 text-rose-800';
+    if (d >= 0.30) colorClass = 'bg-emerald-100 text-emerald-800';
+    else if (d >= 0.20) colorClass = 'bg-blue-100 text-blue-800';
+    else if (d >= 0.00) colorClass = 'bg-amber-100 text-amber-800';
+
+    return (
+      <div className="relative group/d inline-block cursor-help">
+        <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${colorClass}`}>
+          {label} (D = {d > 0 ? `+${d}` : d})
+        </span>
+        <div className="absolute right-0 top-full mt-1.5 hidden group-hover/d:block z-50 w-64 p-3 bg-slate-900 text-white text-[11px] font-normal normal-case rounded-lg shadow-xl pointer-events-none leading-relaxed text-left">
+          <span className="font-bold text-blue-300 block mb-1">Discrimination Index (D) — Kelly&apos;s 27%</span>
+          <p className="text-slate-300 mb-1.5">Separates top 27% scorers from bottom 27% scorers.</p>
+          <div className="space-y-0.5 text-[10px]">
+            <div><strong className="text-emerald-400">&ge; 0.30:</strong> Excellent separation power</div>
+            <div><strong className="text-blue-400">0.20 – 0.29:</strong> Acceptable discrimination</div>
+            <div><strong className="text-amber-400">0.00 – 0.19:</strong> Poor discrimination</div>
+            <div><strong className="text-rose-400">&lt; 0.00:</strong> Flawed (inverted discrimination)</div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   if (selectedExam !== null && currentExam) {
     return (
       <div className="space-y-6 relative pb-24">
-        <div className="flex items-center gap-2 text-sm mb-4">
-          <button onClick={() => { setSelectedExam(null); setSelectedQuestions([]); setSelectedStudentForReview(null); setHasAcknowledgedVoidWarning(false); }} className="text-blue-600 hover:underline font-bold">Exams</button>
-          <span className="text-slate-400">/</span>
-          <span className="text-slate-600 font-bold">{currentExam.title}</span>
+        {/* Navigation Breadcrumb */}
+        <div className="flex items-center gap-3 mb-2">
+          <button 
+            onClick={handleBackToExams} 
+            className="text-slate-500 hover:text-blue-600 font-bold text-sm flex items-center gap-1.5 transition-colors"
+          >
+            &larr; Back to Exams
+          </button>
         </div>
 
+        {/* Tab Header */}
         <div className="bg-slate-900 text-white rounded-t-xl flex gap-8 px-8 pt-5 border-b border-slate-700 overflow-x-auto scrollbar-hide">
-          <button onClick={() => { setExamTab('settings'); setSelectedStudentForReview(null); }} className={`pb-4 border-b-2 text-sm font-bold whitespace-nowrap ${examTab === 'settings' ? 'border-blue-400 text-white' : 'border-transparent text-slate-400 hover:text-slate-200'}`}>
+          <button 
+            onClick={() => { setExamTab('settings'); setSelectedStudentForReview(null); }} 
+            className={`pb-4 border-b-2 text-sm font-bold whitespace-nowrap ${examTab === 'settings' ? 'border-blue-400 text-white' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
+          >
             Exam Settings
           </button>
 
           {currentExam.status === 'Inactive' ? (
-             <button onClick={() => { setExamTab('question_analytics'); setSelectedStudentForReview(null); }} className={`pb-4 border-b-2 text-sm font-bold whitespace-nowrap ${examTab === 'question_analytics' ? 'border-blue-400 text-white' : 'border-transparent text-slate-400 hover:text-slate-200'}`}>
-               Question Analytics
-             </button>
+            <button 
+              onClick={() => { setExamTab('question_analytics'); setSelectedStudentForReview(null); }} 
+              className={`pb-4 border-b-2 text-sm font-bold whitespace-nowrap ${examTab === 'question_analytics' ? 'border-blue-400 text-white' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
+            >
+              Question Analytics
+            </button>
           ) : (
             <button
               onClick={() => { setExamTab('questions'); setSelectedStudentForReview(null); }}
@@ -1126,11 +1521,11 @@ function FacultyExamsContent() {
              </form>
           )}
 
-          {/* QUESTION VALIDATION / MAINTENANCE TAB */}
+          {/* VIEW QUESTIONS / QUESTION VALIDATION TAB */}
           {examTab === 'questions' && (
             <div>
               <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
-                <div>
+                <div className="flex-1 min-w-0 pr-4">
                   <h2 className="text-xl font-bold text-slate-800">
                     {isReadOnly ? 'Exam Questions' : isMaintenanceMode ? 'Maintenance Mode: Exam Questions' : 'Question Validation'}
                   </h2>
@@ -1143,22 +1538,37 @@ function FacultyExamsContent() {
                   </p>
                 </div>
 
-                {isValidationMode && (
-                  <div className="flex bg-slate-100 p-1 rounded-lg border border-slate-200 w-full md:w-auto">
-                    <button
-                      onClick={() => { setValidationTab('pending'); setSelectedQuestions([]); }}
-                      className={`flex-1 md:flex-none px-6 py-2 text-sm font-bold rounded-md transition-all ${validationTab === 'pending' ? 'bg-white shadow-sm text-blue-700' : 'text-slate-500 hover:text-slate-700'}`}
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 shrink-0">
+                  {availableCompetencies.length > 0 && (
+                    <select
+                      value={selectedCompetencyFilter}
+                      onChange={(e) => setSelectedCompetencyFilter(e.target.value)}
+                      className="w-full sm:w-64 px-3 py-2 border border-slate-300 rounded-lg text-xs font-bold text-slate-700 bg-slate-50 focus:outline-none focus:border-blue-500"
                     >
-                      Pending Review ({pendingQuestions.length})
-                    </button>
-                    <button
-                      onClick={() => { setValidationTab('approved'); setSelectedQuestions([]); }}
-                      className={`flex-1 md:flex-none px-6 py-2 text-sm font-bold rounded-md transition-all ${validationTab === 'approved' ? 'bg-white shadow-sm text-emerald-700' : 'text-slate-500 hover:text-slate-700'}`}
-                    >
-                      Approved Items ({approvedQuestions.length})
-                    </button>
-                  </div>
-                )}
+                      <option value="All">All Competencies ({aiQuestions.length})</option>
+                      {availableCompetencies.map(comp => (
+                        <option key={comp} value={comp}>{comp}</option>
+                      ))}
+                    </select>
+                  )}
+
+                  {isValidationMode && (
+                    <div className="flex bg-slate-100 p-1 rounded-lg border border-slate-200">
+                      <button
+                        onClick={() => { setValidationTab('pending'); setSelectedQuestions([]); }}
+                        className={`flex-1 sm:flex-none px-5 py-2 text-xs font-bold rounded-md transition-all ${validationTab === 'pending' ? 'bg-white shadow-sm text-blue-700' : 'text-slate-500 hover:text-slate-700'}`}
+                      >
+                        Pending Review ({pendingQuestions.length})
+                      </button>
+                      <button
+                        onClick={() => { setValidationTab('approved'); setSelectedQuestions([]); }}
+                        className={`flex-1 sm:flex-none px-5 py-2 text-xs font-bold rounded-md transition-all ${validationTab === 'approved' ? 'bg-white shadow-sm text-emerald-700' : 'text-slate-500 hover:text-slate-700'}`}
+                      >
+                        Approved Items ({approvedQuestions.length})
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
 
               {isValidationMode && validationTab === 'pending' && pendingQuestions.length > 0 && (
@@ -1178,11 +1588,13 @@ function FacultyExamsContent() {
               <div className="space-y-6">
                 {visibleQuestions.length === 0 ? (
                   <div className="p-12 text-center border-2 border-dashed border-slate-200 rounded-xl bg-slate-50">
-                    <p className="text-slate-500 font-bold text-sm">No questions available in this queue.</p>
+                    <p className="text-slate-500 font-bold text-sm">No questions match your current view or filter.</p>
                   </div>
                 ) : (
                   visibleQuestions.map((q, index) => {
                     const isProcessing = regeneratingItems.includes(q.id);
+                    const isExpanded = !!expandedQuestionDetails[q.id];
+
                     return (
                       <div key={q.id} className={`relative p-6 border rounded-xl transition-colors ${selectedQuestions.includes(q.id) ? 'border-blue-400 bg-blue-50/50' : 'border-slate-200 bg-white'}`}>
 
@@ -1217,9 +1629,9 @@ function FacultyExamsContent() {
                           )}
                         </div>
 
-                        <div className="mb-6 md:ml-11">
-                          <div className="space-y-3 mb-6">
-                            {q.options.map((opt, idx) => (
+                        <div className="mb-4 md:ml-11">
+                          <div className="space-y-3 mb-4">
+                            {(Array.isArray(q.options) ? q.options : parseOptionsArray(q.options)).map((opt, idx) => (
                               <div key={idx} className={`p-4 border rounded-lg text-sm font-bold ${normalizeForComparison(opt) === normalizeForComparison(q.answer) ? 'bg-emerald-50 border-emerald-200 text-emerald-900' : 'bg-white border-slate-200 text-slate-600'}`}>
                                 <span className="mr-3 text-slate-400">{String.fromCharCode(65 + idx)}.</span>
                                 {opt}
@@ -1228,19 +1640,35 @@ function FacultyExamsContent() {
                             ))}
                           </div>
 
-                          <div className="grid grid-cols-1 gap-3 mt-6">
-                            <div className="bg-slate-50 border border-slate-200 p-4 rounded-lg flex flex-col gap-1">
-                              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Target Competency / Topic</span>
-                              <p className="text-sm font-bold text-slate-900">{q.topic}</p>
-                            </div>
-                            <div className="bg-slate-50 border border-slate-200 p-4 rounded-lg flex flex-col gap-1">
-                              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Rationale</span>
-                              <p className="text-sm font-bold text-slate-900 leading-relaxed">{q.rationale}</p>
-                            </div>
-                            <div className="bg-slate-50 border border-slate-200 p-4 rounded-lg flex flex-col gap-1">
-                              <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Sources</span>
-                              <p className="text-sm font-bold text-slate-900 leading-relaxed">{q.citation}</p>
-                            </div>
+                          {/* Collapsible Details */}
+                          <div className="pt-2 border-t border-slate-100">
+                            <button
+                              type="button"
+                              onClick={() => toggleQuestionDetails(q.id)}
+                              className="text-xs font-bold text-blue-600 hover:text-blue-800 flex items-center gap-1.5 py-1"
+                            >
+                              <svg className={`w-3.5 h-3.5 transition-transform duration-200 ${isExpanded ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                              </svg>
+                              <span>{isExpanded ? 'Hide' : 'View'} Question Details (Topic, Rationale, Sources)</span>
+                            </button>
+
+                            {isExpanded && (
+                              <div className="grid grid-cols-1 gap-3 mt-4 animate-in fade-in duration-200">
+                                <div className="bg-slate-50 border border-slate-200 p-3.5 rounded-lg flex flex-col gap-1">
+                                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Target Competency / Topic</span>
+                                  <p className="text-sm font-bold text-slate-900">{q.topic}</p>
+                                </div>
+                                <div className="bg-slate-50 border border-slate-200 p-3.5 rounded-lg flex flex-col gap-1">
+                                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Rationale</span>
+                                  <p className="text-sm font-bold text-slate-900 leading-relaxed">{q.rationale}</p>
+                                </div>
+                                <div className="bg-slate-50 border border-slate-200 p-3.5 rounded-lg flex flex-col gap-1">
+                                  <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Sources</span>
+                                  <p className="text-sm font-bold text-slate-900 leading-relaxed">{q.citation}</p>
+                                </div>
+                              </div>
+                            )}
                           </div>
                         </div>
 
@@ -1265,6 +1693,26 @@ function FacultyExamsContent() {
                                   </button>
                                 </div>
                               </>
+                            ) : isValidationMode && validationTab === 'approved' ? (
+                              <div className="flex gap-3 w-full justify-between items-center">
+                                <button
+                                  type="button"
+                                  onClick={() => handleRevokeApproval(q.id)}
+                                  className="px-4 py-2 bg-amber-50 border border-amber-300 text-amber-800 text-xs font-bold rounded-lg hover:bg-amber-100 transition-colors shadow-xs flex items-center gap-1.5"
+                                >
+                                  <svg className="w-3.5 h-3.5 text-amber-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" />
+                                  </svg>
+                                  Revoke to Pending
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => { setEditingItem(q); setShowEditModal(true); }}
+                                  className="px-4 py-2 bg-slate-100 border border-slate-200 text-slate-700 text-xs font-bold rounded-lg hover:bg-slate-200 transition-colors shadow-xs"
+                                >
+                                  Edit Manually
+                                </button>
+                              </div>
                             ) : isMaintenanceMode ? (
                               <div className="flex gap-3 w-full justify-end">
                                 <button onClick={() => executeProtectedAction(() => { setEditingItem(q); setShowEditModal(true); })} className="px-5 py-2.5 bg-slate-100 border border-slate-200 text-slate-700 text-xs font-bold rounded-lg hover:bg-slate-200 transition-colors shadow-sm">
@@ -1289,7 +1737,8 @@ function FacultyExamsContent() {
               </div>
             </div>
           )}
-          {/* GRADEBOOK TAB (Formerly Student Analytics) */}
+
+          {/* GRADEBOOK TAB */}
           {examTab === 'gradebook' && (
             <div>
               {isLoadingReview ? (
@@ -1311,22 +1760,20 @@ function FacultyExamsContent() {
                     </span>
                   </div>
 
-                  <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                  {/* Compact Header Profile & Single Score Box */}
+                  <div className="bg-white p-4 sm:p-5 rounded-xl border border-slate-200 shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
                     <div>
-                      <h3 className="text-xl font-bold text-slate-800">{selectedStudentForReview.name}</h3>
-                      <p className="text-xs text-slate-500 font-bold mt-1">
-                        Viewing Attempt {activeAttemptIndex + 1} of {selectedStudentForReview.attempts.length} — Submitted on {formatAttemptDate(selectedStudentForReview.attempts[activeAttemptIndex].takenAt)}
-                      </p>
+                      <h3 className="text-xl font-bold text-slate-800 leading-none">{selectedStudentForReview.name}</h3>
                     </div>
 
                     <div className="flex flex-col sm:flex-row items-center gap-4 w-full md:w-auto">
                       <div className="relative min-w-[280px]">
                         <button
                           onClick={() => setIsReviewDropdownOpen(!isReviewDropdownOpen)}
-                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-bold text-slate-800 bg-white flex justify-between items-center transition-colors hover:border-blue-400 focus:outline-none focus:ring-1 focus:ring-blue-500 shadow-sm"
+                          className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-bold text-slate-800 bg-white flex justify-between items-center transition-colors hover:border-blue-400 shadow-sm"
                         >
-                          <span className="uppercase text-xs tracking-wider">
-                            ATTEMPT {activeAttemptIndex + 1}/{selectedStudentForReview.attempts.length} (SUBMITTED {formatAttemptDate(selectedStudentForReview.attempts[activeAttemptIndex].takenAt).toUpperCase()})
+                          <span className="uppercase tracking-wider">
+                            ATTEMPT {activeAttemptIndex + 1}/{selectedStudentForReview.attempts.length} ({formatAttemptDate(selectedStudentForReview.attempts[activeAttemptIndex].takenAt).toUpperCase()})
                           </span>
                           <svg className={`w-4 h-4 ml-2 transition-transform duration-200 text-slate-500 ${isReviewDropdownOpen ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
@@ -1339,6 +1786,13 @@ function FacultyExamsContent() {
                             <div className="absolute z-20 w-full mt-1 bg-white border border-slate-200 rounded-lg shadow-xl overflow-hidden py-1.5 animate-in fade-in slide-in-from-top-2">
                               {selectedStudentForReview.attempts.map((att, idx) => {
                                 const isSelected = activeAttemptIndex === idx;
+                                const maxScore = Math.max(...selectedStudentForReview.attempts.map(a => a.scorePercentage));
+                                const isGradedAttempt = currentExam?.gradingLogic === 'highest' 
+                                  ? att.scorePercentage === maxScore 
+                                  : currentExam?.gradingLogic === 'latest' 
+                                  ? idx === selectedStudentForReview.attempts.length - 1 
+                                  : false;
+
                                 return (
                                   <div 
                                     key={idx}
@@ -1346,11 +1800,21 @@ function FacultyExamsContent() {
                                     className={`flex justify-between items-center px-4 py-3 cursor-pointer transition-colors border-l-4 ${isSelected ? 'bg-blue-50 border-blue-600' : 'hover:bg-slate-50 border-transparent'}`}
                                   >
                                     <div>
-                                      <div className={`text-sm font-bold ${isSelected ? 'text-blue-900' : 'text-slate-800'}`}>Attempt {idx + 1}</div>
+                                      <div className={`text-sm font-bold flex items-center gap-2 ${isSelected ? 'text-blue-900' : 'text-slate-800'}`}>
+                                        <span>Attempt {idx + 1}</span>
+                                        {isGradedAttempt && (
+                                          <span className="px-1.5 py-0.5 bg-amber-100 text-amber-800 text-[10px] font-bold rounded">
+                                            ★ Graded
+                                          </span>
+                                        )}
+                                      </div>
                                       <div className={`text-xs font-bold mt-0.5 ${isSelected ? 'text-blue-600' : 'text-slate-500'}`}>Submitted {formatAttemptDate(att.takenAt)}</div>
                                     </div>
-                                    <div className={`px-2.5 py-1 rounded text-xs font-bold shrink-0 border ${isSelected ? 'bg-emerald-500 border-emerald-600 text-white' : 'bg-emerald-100 border-emerald-200 text-emerald-800'}`}>
-                                      {att.rawScore} / {att.maxScore}
+                                    <div className="flex gap-2 items-center">
+                                      <span className="text-xs font-bold text-slate-500">{att.rawScore}/{att.maxScore}</span>
+                                      <span className="px-2 py-0.5 rounded text-xs font-bold bg-blue-100 text-blue-800">
+                                        {att.scorePercentage}%
+                                      </span>
                                     </div>
                                   </div>
                                 );
@@ -1360,15 +1824,36 @@ function FacultyExamsContent() {
                         )}
                       </div>
                       
-                      <div className="bg-slate-50 border border-slate-200 px-4 py-2 rounded-lg text-center min-w-[120px]">
-                        <span className="text-2xl font-black text-blue-600 block leading-none">
+                      {/* Single Clean Score Box */}
+                      <div className="bg-slate-50 border border-slate-200 px-4 py-2 rounded-lg text-center min-w-[130px]">
+                        <span className="text-xl font-black text-blue-600 block leading-none">
                           {selectedStudentForReview.attempts[activeAttemptIndex].rawScore} / {selectedStudentForReview.attempts[activeAttemptIndex].maxScore}
                         </span>
-                        <span className="text-[10px] uppercase font-bold text-slate-400 tracking-wider mt-1 block">Attempt Score</span>
+                        <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wider mt-1 block">
+                          Score: {selectedStudentForReview.attempts[activeAttemptIndex].scorePercentage}%
+                        </span>
                       </div>
                     </div>
                   </div>
 
+                  {/* Areas Requiring Remediation Card */}
+                  {selectedStudentForReview.attempts[activeAttemptIndex].weakCompetencies.length > 0 && (
+                    <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl">
+                      <div className="flex items-center gap-2 mb-2 text-amber-900 font-bold text-xs uppercase tracking-wider">
+                        <span>⚠️</span>
+                        <span>Areas Requiring Remedial Attention (&lt; 60% Accuracy):</span>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {selectedStudentForReview.attempts[activeAttemptIndex].weakCompetencies.map((w, idx) => (
+                          <span key={idx} className="px-3 py-1 bg-white border border-amber-200 text-amber-800 text-xs font-bold rounded-lg shadow-sm">
+                            {w.topic}: <span className="text-rose-600">{w.accuracy}%</span>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Question Review List */}
                   <div className="grid gap-6">
                     {selectedStudentForReview.attempts[activeAttemptIndex].items.map((item) => (
                       <div
@@ -1377,16 +1862,19 @@ function FacultyExamsContent() {
                           item.isCorrect ? 'border-l-emerald-500' : 'border-l-rose-500'
                         }`}
                       >
-                        <div className="flex justify-between items-center text-xs font-bold text-slate-400 mb-1">
-                          <span className="uppercase tracking-wider">Question {item.qNum}</span>
-                          <span className={`px-2 py-1 rounded uppercase tracking-wider ${item.isCorrect ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'}`}>
+                        <div className="flex justify-between items-start mb-2">
+                          <div className="flex items-center gap-3">
+                            <span className="w-7 h-7 rounded-full bg-slate-100 text-slate-700 flex items-center justify-center text-xs font-bold border border-slate-200 shrink-0">
+                              {item.qNum}
+                            </span>
+                            <p className="text-base font-bold text-slate-900 leading-relaxed">{item.text}</p>
+                          </div>
+                          <span className={`shrink-0 px-2.5 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${
+                            item.isCorrect ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-rose-50 text-rose-700 border border-rose-200'
+                          }`}>
                             {item.isCorrect ? '✓ Correct' : '✗ Incorrect'}
                           </span>
                         </div>
-
-                        <p className="text-base font-bold text-slate-800 leading-relaxed mb-2">
-                          {item.text}
-                        </p>
 
                         <div className="space-y-2">
                           {item.options.map((opt, i) => {
@@ -1436,8 +1924,8 @@ function FacultyExamsContent() {
                 <div>
                   <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
                     <div>
-                      <h2 className="text-xl font-bold text-slate-800">Gradebook & Analytics</h2>
-                      <p className="text-sm text-slate-500 font-bold mt-1">Review student progress, completion grades, and specific attempts.</p>
+                      <h2 className="text-xl font-bold text-slate-800">Gradebook</h2>
+                      <p className="text-sm text-slate-500 font-bold mt-1">Review student progress, scores, and completed attempt logs.</p>
                     </div>
                     <button onClick={exportToCSV} className="px-4 py-2 border border-slate-300 text-slate-900 text-xs font-bold rounded-lg hover:bg-slate-50 transition-colors shadow-sm flex items-center gap-2">
                       <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
@@ -1453,6 +1941,8 @@ function FacultyExamsContent() {
                       onChange={handleStudentSearch}
                       className="w-full md:w-64 px-3 py-2 border border-slate-300 rounded text-sm font-bold text-slate-900 focus:outline-none focus:ring-1 focus:ring-blue-500"
                     />
+                    
+                    {/* Status Filter */}
                     <select
                       value={studentStatusFilter}
                       onChange={handleStudentStatusChange}
@@ -1463,6 +1953,20 @@ function FacultyExamsContent() {
                       <option value="In Progress">In Progress</option>
                       <option value="Not Taken">Not Taken</option>
                     </select>
+
+                    {/* Cohort Filter */}
+                    <select
+                      value={studentCohortFilter}
+                      onChange={(e) => { setStudentCohortFilter(e.target.value); resetPage(); }}
+                      className="px-3 py-2 border border-slate-300 rounded text-sm font-bold text-slate-900 focus:outline-none focus:ring-1 focus:ring-blue-500 bg-white"
+                    >
+                      <option value="All">All Assigned Cohorts</option>
+                      {teacherCohorts
+                        .filter(c => currentExam.cohortIds?.includes(c.id))
+                        .map(c => (
+                          <option key={c.id} value={c.id}>{c.name}</option>
+                        ))}
+                    </select>
                   </div>
 
                   <div className="overflow-x-auto border border-slate-200 rounded-b-lg">
@@ -1470,40 +1974,56 @@ function FacultyExamsContent() {
                       <thead>
                         <tr className="bg-slate-50 border-b border-slate-200">
                           <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500">Student Name</th>
+                          <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500">Cohort</th>
                           <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500">Status</th>
-                          <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500">Final Grade</th>
-                          <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500 text-right">Attempt Logs</th>
+                          <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500">Score (%)</th>
+                          <th className="p-4 text-xs font-bold uppercase tracking-wider text-slate-500 text-right">Attempts</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100 text-sm">
                         {isFetchingAnalytics ? (
-                          <tr><td colSpan={4} className="p-8 text-center text-sm font-bold text-slate-500">Loading gradebook...</td></tr>
+                          <tr><td colSpan={5} className="p-8 text-center text-sm font-bold text-slate-500">Loading gradebook...</td></tr>
                         ) : currentStudents.length === 0 ? (
-                          <tr><td colSpan={4} className="p-8 text-center text-sm font-bold text-slate-500">No students match your filter criteria.</td></tr>
+                          <tr><td colSpan={5} className="p-8 text-center text-sm font-bold text-slate-500">No students match your filter criteria.</td></tr>
                         ) : (
-                          currentStudents.map(student => (
-                            <tr key={student.id} className="hover:bg-slate-50 transition-colors bg-white">
-                              <td className="p-4 font-bold text-slate-800">{student.name}</td>
-                              <td className="p-4">
-                                <span className={`inline-block px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider ${student.status === 'Completed' ? 'bg-emerald-100 text-emerald-800' : student.status === 'In Progress' ? 'bg-blue-100 text-blue-800' : 'bg-slate-200 text-slate-600'}`}>
-                                  {student.status}
-                                </span>
-                              </td>
-                              <td className="p-4 font-bold text-slate-700">{student.grade}</td>
-                              <td className="p-4 text-right flex gap-2 justify-end flex-wrap">
-                                {student.attempts && student.attempts.length > 0 ? (
-                                  <button
-                                    onClick={() => handleViewStudent(student)}
-                                    className="text-xs font-bold text-blue-600 hover:underline cursor-pointer"
-                                  >
-                                    View Attempts ({student.attempts.length})
-                                  </button>
-                                ) : (
-                                  <span className="text-xs font-bold text-slate-400">No Attempts</span>
-                                )}
-                              </td>
-                            </tr>
-                          ))
+                          currentStudents.map(student => {
+                            const cohortName = teacherCohorts.find(c => c.id === student.cohortId)?.name || 'General';
+
+                            return (
+                              <tr key={student.id} className="hover:bg-slate-50 transition-colors bg-white">
+                                <td className="p-4 font-bold text-slate-800">{student.name}</td>
+                                <td className="p-4">
+                                  <span className="px-2 py-0.5 bg-slate-100 border border-slate-200 text-slate-600 rounded text-xs font-bold whitespace-nowrap">
+                                    {cohortName}
+                                  </span>
+                                </td>
+                                <td className="p-4">
+                                  <span className={`inline-block px-2.5 py-1 rounded-md text-[10px] font-bold uppercase tracking-wider ${
+                                    student.status === 'Completed' ? 'bg-emerald-100 text-emerald-800' :
+                                    student.status === 'In Progress' ? 'bg-blue-100 text-blue-800' :
+                                    'bg-slate-200 text-slate-600'
+                                  }`}>
+                                    {student.status}
+                                  </span>
+                                </td>
+                                <td className="p-4 font-bold text-slate-800">
+                                  {student.grade}
+                                </td>
+                                <td className="p-4 text-right">
+                                  {student.attempts && student.attempts.length > 0 ? (
+                                    <button
+                                      onClick={() => handleViewStudent(student)}
+                                      className="text-xs font-bold text-blue-600 hover:underline cursor-pointer"
+                                    >
+                                      View Attempts ({student.attempts.length})
+                                    </button>
+                                  ) : (
+                                    <span className="text-xs font-bold text-slate-400">0 Attempts</span>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })
                         )}
                       </tbody>
                     </table>
@@ -1515,41 +2035,248 @@ function FacultyExamsContent() {
 
           {/* QUESTION ANALYTICS TAB */}
           {examTab === 'question_analytics' && (
-             <div>
-               <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
-                 <div>
-                   <h2 className="text-xl font-bold text-slate-800">Question Analytics</h2>
-                   <p className="text-sm text-slate-500 font-bold mt-1">Review the answer selection breakdown for each deployed item.</p>
-                 </div>
-               </div>
-               <div className="space-y-8">
-                 {isFetchingAnalytics ? (
-                   <div className="p-12 text-center text-slate-500 font-bold border border-slate-200 rounded-xl">Loading question analytics...</div>
-                 ) : questionAnalytics.length === 0 ? (
-                   <div className="p-12 text-center text-slate-500 font-bold border border-slate-200 rounded-xl">No analytics available for this exam.</div>
-                 ) : questionAnalytics.map((qa, index) => (
-                   <div key={qa.id} className="p-6 border border-slate-200 rounded-xl bg-white shadow-sm">
-                      <div className="flex items-start gap-4 mb-6">
-                        <span className="w-8 h-8 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center text-sm font-bold border border-blue-200 shrink-0">
-                          {index + 1}
-                        </span>
-                        <p className="text-lg font-bold text-slate-900 mt-1">{qa.question}</p>
+            <div>
+              {/* Single-Row Header Toolbar */}
+              <div className="mb-6 pb-4 border-b border-slate-200 flex flex-col xl:flex-row xl:items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-xl font-bold text-slate-800">Question Analytics</h2>
+                  <p className="text-xs text-slate-500 font-bold mt-0.5">
+                    Student selection rates, distractor diagnostics, and Classical Test Theory indices.
+                  </p>
+                </div>
+
+                {/* Controls in a Single Row */}
+                <div className="flex items-center gap-2.5 flex-wrap xl:flex-nowrap shrink-0">
+                  {/* Hover Information Tooltip */}
+                  <div className="relative group">
+                    <button
+                      type="button"
+                      aria-label="Psychometric Guide"
+                      className="w-9 h-9 rounded-lg bg-blue-50 border border-blue-200 text-blue-700 hover:bg-blue-100 flex items-center justify-center font-black text-xs transition-colors shrink-0 cursor-help"
+                    >
+                      ℹ
+                    </button>
+
+                    {/* Tooltip Card */}
+                    <div className="absolute right-0 top-full mt-2 w-80 md:w-96 bg-slate-900 text-white text-xs rounded-xl shadow-2xl p-4 z-50 hidden group-hover:block pointer-events-none animate-in fade-in duration-150">
+                      <h4 className="font-bold text-blue-300 text-xs uppercase tracking-wider mb-2.5 pb-1 border-b border-slate-800">
+                        Psychometric Indices Guide
+                      </h4>
+                      <div className="space-y-2.5 text-[11px] leading-relaxed">
+                        <div>
+                          <span className="font-bold text-white block">Facility Index (P) — Difficulty:</span>
+                          <span className="text-slate-300">
+                            Percentage of examinees correct. <strong className="text-emerald-400">0.40–0.70</strong> is ideal, <strong className="text-amber-400">&lt;0.25</strong> is difficult/suspect, <strong className="text-blue-400">&gt;0.85</strong> is very easy.
+                          </span>
+                        </div>
+                        <div>
+                          <span className="font-bold text-white block">Discrimination Index (D) — Kelly&apos;s 27%:</span>
+                          <span className="text-slate-300">
+                            Separation between top and bottom scorers. <strong className="text-emerald-400">&ge;0.30</strong> is excellent; <strong className="text-rose-400">&lt;0.20</strong> indicates poor discrimination.
+                          </span>
+                        </div>
+                        <div>
+                          <span className="font-bold text-white block">KR-20 Reliability:</span>
+                          <span className="text-slate-300">
+                            Overall test consistency (0.00 to 1.00). Target benchmark is <strong className="text-indigo-300">&ge;0.70</strong> for reliable assessments.
+                          </span>
+                        </div>
+                        <div>
+                          <span className="font-bold text-white block">NFD (Non-Functional Distractor):</span>
+                          <span className="text-slate-300">
+                            A wrong option chosen by <strong className="text-amber-300">&lt;5%</strong> of examinees. These fail to attract unprepared students and should be revised.
+                          </span>
+                        </div>
                       </div>
-                      <div className="space-y-4 md:ml-12">
-                         {qa.options.map((opt: any, idx: number) => (
-                           <div key={idx} className="relative w-full bg-slate-100 rounded-lg h-12 flex items-center px-4 overflow-hidden border border-slate-200">
-                             <div className={`absolute left-0 top-0 h-full ${opt.isCorrect ? 'bg-emerald-200' : 'bg-slate-300'} opacity-40 transition-all duration-1000`} style={{ width: `${opt.percent}%` }}></div>
-                             <div className="relative z-10 flex justify-between w-full text-sm font-bold text-slate-800">
-                               <span><span className="mr-2 text-slate-500">{String.fromCharCode(65 + idx)}.</span>{opt.text} {opt.isCorrect && <span className="text-emerald-700 ml-2 uppercase tracking-wider text-[10px]">(Correct)</span>}</span>
-                               <span className="bg-white/80 px-2 py-0.5 rounded text-xs">{opt.count} students ({opt.percent}%)</span>
-                             </div>
-                           </div>
-                         ))}
+                    </div>
+                  </div>
+
+                  {/* KR-20 Badge */}
+                  {kr20Reliability !== null && (
+                    <div className="bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-lg text-center shrink-0">
+                      <span className="text-[9px] font-bold text-slate-400 block uppercase tracking-wider leading-none">KR-20</span>
+                      <span className="text-xs font-black text-indigo-700 leading-none">{kr20Reliability}</span>
+                    </div>
+                  )}
+
+                  {/* Attempt Basis Filter */}
+                  <select
+                    value={analyticsAttemptBasis}
+                    onChange={(e: any) => setAnalyticsAttemptBasis(e.target.value)}
+                    className="w-36 px-2.5 py-2 border border-slate-300 rounded-lg text-xs font-bold text-slate-700 bg-white focus:outline-none focus:border-blue-500 shrink-0"
+                    title="Select Attempt Basis"
+                  >
+                    <option value="graded">Graded Attempt ({currentExam.gradingLogic})</option>
+                    <option value="first">First Attempt Only</option>
+                    <option value="all">All Submissions</option>
+                  </select>
+
+                  {/* Cohort Filter */}
+                  <select
+                    value={analyticsCohortFilter}
+                    onChange={(e) => setAnalyticsCohortFilter(e.target.value)}
+                    className="w-32 px-2.5 py-2 border border-slate-300 rounded-lg text-xs font-bold text-slate-700 bg-white focus:outline-none focus:border-blue-500 shrink-0"
+                    title="Filter by Cohort"
+                  >
+                    <option value="All">All Cohorts</option>
+                    {teacherCohorts
+                      .filter(c => currentExam.cohortIds?.includes(c.id))
+                      .map(c => (
+                        <option key={c.id} value={c.id}>{c.name}</option>
+                      ))}
+                  </select>
+
+                  {/* Competency Filter (Truncated) */}
+                  {availableCompetencies.length > 0 && (
+                    <select
+                      value={selectedCompetencyFilter}
+                      onChange={(e) => setSelectedCompetencyFilter(e.target.value)}
+                      className="w-48 px-2.5 py-2 border border-slate-300 rounded-lg text-xs font-bold text-slate-700 bg-white focus:outline-none focus:border-blue-500 shrink-0 truncate"
+                      title={selectedCompetencyFilter === 'All' ? 'All Competencies' : selectedCompetencyFilter}
+                    >
+                      <option value="All">All Competencies ({questionAnalytics.length})</option>
+                      {availableCompetencies.map(comp => (
+                        <option key={comp} value={comp}>{comp}</option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+              </div>
+
+              {/* Questions Analytics List */}
+              <div className="space-y-6">
+                {isFetchingAnalytics ? (
+                  <div className="p-12 text-center text-slate-500 font-bold border border-slate-200 rounded-xl">
+                    Loading question analytics...
+                  </div>
+                ) : filteredQuestionAnalytics.length === 0 ? (
+                  <div className="p-12 text-center text-slate-500 font-bold border border-slate-200 rounded-xl">
+                    No analytics available for this filter. Ensure student attempts are completed.
+                  </div>
+                ) : (
+                  filteredQuestionAnalytics.map((qa, index) => {
+                    const matchingQuestion = aiQuestions.find(q => q.id === qa.id);
+                    const isExpanded = !!expandedQuestionDetails[qa.id];
+
+                    return (
+                      <div key={qa.id} className="p-6 border border-slate-200 rounded-xl bg-white shadow-sm">
+                        {/* Header: Question Number, Prompt Text, and Vertically Stacked P & D Badges */}
+                        <div className="flex justify-between items-start mb-5 pb-4 border-b border-slate-100 gap-4">
+                          <div className="flex items-start gap-3 flex-1 min-w-0">
+                            <span className="w-8 h-8 shrink-0 mt-0.5 rounded-full bg-slate-100 text-slate-600 flex items-center justify-center text-sm font-bold border border-slate-200">
+                              {index + 1}
+                            </span>
+                            <div className="flex-1 min-w-0 pr-2">
+                              <p className="text-base font-bold text-slate-900 leading-relaxed pt-1">{qa.question}</p>
+                              <span className="text-xs text-slate-400 font-bold mt-1 block">
+                                {qa.totalAnswers} response{qa.totalAnswers === 1 ? '' : 's'} recorded (
+                                {analyticsAttemptBasis === 'graded'
+                                  ? '1 vote per student'
+                                  : analyticsAttemptBasis === 'first'
+                                  ? 'first attempt'
+                                  : 'all attempts'}
+                                )
+                              </span>
+                            </div>
+                          </div>
+
+                          {/* Vertically Stacked Difficulty & Discrimination Badges */}
+                          <div className="flex flex-col items-end gap-1.5 shrink-0 self-start">
+                            {getDifficultyBadge(qa.facilityIndex, qa.facilityLabel)}
+                            {getDiscriminationBadge(qa.discriminationIndex, qa.discriminationLabel)}
+                          </div>
+                        </div>
+
+                        {/* Options List: Correct Answer Highlighted in Green Without Text Clutter */}
+                        <div className="mb-4 md:ml-11 space-y-3">
+                          {qa.options.map((opt: any, idx: number) => (
+                            <div
+                              key={idx}
+                              className="relative w-full bg-slate-100 rounded-lg min-h-[48px] py-2.5 px-4 flex items-center overflow-hidden border border-slate-200"
+                            >
+                              <div
+                                className={`absolute left-0 top-0 h-full ${
+                                  opt.isCorrect ? 'bg-emerald-200' : 'bg-slate-300'
+                                } opacity-40 transition-all duration-1000`}
+                                style={{ width: `${opt.percent}%` }}
+                              ></div>
+                              <div className="relative z-10 flex flex-col sm:flex-row sm:items-center justify-between w-full gap-2 text-sm font-bold text-slate-800">
+                                <div className="flex items-start sm:items-center gap-2 flex-1 min-w-0 pr-2">
+                                  <span className="text-slate-500 shrink-0">{String.fromCharCode(65 + idx)}.</span>
+                                  <span className="leading-snug">{opt.text}</span>
+                                  {opt.isNonFunctional && (
+                                    <span className="text-amber-700 uppercase tracking-wider text-[9px] font-bold bg-amber-50 px-1.5 py-0.5 rounded border border-amber-200 shrink-0 ml-1">
+                                      NFD (&lt;5%)
+                                    </span>
+                                  )}
+                                </div>
+                                <span
+                                  className={`px-2.5 py-1 rounded-md text-xs font-bold shrink-0 self-end sm:self-center shadow-xs border transition-colors ${
+                                    opt.isCorrect
+                                      ? 'bg-emerald-600 text-white border-emerald-700 font-extrabold'
+                                      : 'bg-white/95 border-slate-200 text-slate-700'
+                                  }`}
+                                >
+                                  {opt.count} students ({opt.percent}%)
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+
+                        {/* Collapsible Details */}
+                        <div className="md:ml-11 pt-3 border-t border-slate-100">
+                          <button
+                            type="button"
+                            onClick={() => toggleQuestionDetails(qa.id)}
+                            className="text-xs font-bold text-blue-600 hover:text-blue-800 flex items-center gap-1.5 py-1"
+                          >
+                            <svg
+                              className={`w-3.5 h-3.5 transition-transform duration-200 ${
+                                isExpanded ? 'rotate-180' : ''
+                              }`}
+                              fill="none"
+                              viewBox="0 0 24 24"
+                              stroke="currentColor"
+                            >
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                            </svg>
+                            <span>{isExpanded ? 'Hide' : 'View'} Question Details (Topic, Rationale, Sources)</span>
+                          </button>
+
+                          {isExpanded && matchingQuestion && (
+                            <div className="grid grid-cols-1 gap-3 mt-4 animate-in fade-in duration-200">
+                              <div className="bg-slate-50 border border-slate-200 p-3.5 rounded-lg flex flex-col gap-1">
+                                <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                                  Target Competency / Topic
+                                </span>
+                                <p className="text-sm font-bold text-slate-900">{matchingQuestion.topic}</p>
+                              </div>
+                              <div className="bg-slate-50 border border-slate-200 p-3.5 rounded-lg flex flex-col gap-1">
+                                <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                                  Rationale
+                                </span>
+                                <p className="text-sm font-bold text-slate-900 leading-relaxed">
+                                  {matchingQuestion.rationale}
+                                </p>
+                              </div>
+                              <div className="bg-slate-50 border border-slate-200 p-3.5 rounded-lg flex flex-col gap-1">
+                                <span className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">
+                                  Sources
+                                </span>
+                                <p className="text-sm font-bold text-slate-900 leading-relaxed">
+                                  {matchingQuestion.citation}
+                                </p>
+                              </div>
+                            </div>
+                          )}
+                        </div>
                       </div>
-                   </div>
-                 ))}
-               </div>
-             </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
           )}
 
         </div>
@@ -1565,7 +2292,7 @@ function FacultyExamsContent() {
                 <h3 className="text-xl font-bold text-slate-800">Final Validation Approval</h3>
               </div>
               <p className="text-sm text-slate-600 font-bold mb-6 pl-13 leading-relaxed">
-                You are about to approve the last pending question(s) in this queue. Doing so will complete the validation process and automatically change this exam's status to <span className="text-emerald-600">Active</span>, deploying it to the students. Proceed?
+                You are about to approve the last pending question(s) in this queue. Doing so will complete the validation process and automatically change this exam&apos;s status to <span className="text-emerald-600">Active</span>, deploying it to the students. Proceed?
               </p>
               <div className="flex justify-end gap-3 pt-2">
                 <button onClick={() => { setShowActivationModal(false); setPendingApprovalAction(null); }} className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-bold rounded-lg transition-colors">
@@ -1687,7 +2414,7 @@ function FacultyExamsContent() {
           <h1 className="text-2xl font-bold text-slate-800">Exam Management</h1>
           <p className="text-sm text-slate-500 mt-1 font-bold">Create, monitor, and validate mock exams for your assigned cohorts.</p>
         </div>
-        <button onClick={() => router.push('/faculty/exams/create')} className="px-6 py-2.5 bg-blue-600 text-white text-sm font-bold rounded-lg hover:bg-blue-700 transition-colors shadow-sm whitespace-nowrap">
+        <button onClick={() => {setIsNavigating(true); router.push('/faculty/exams/create')}} className="px-6 py-2.5 bg-blue-600 text-white text-sm font-bold rounded-lg hover:bg-blue-700 transition-colors shadow-sm whitespace-nowrap">
           + Create New Exam
         </button>
       </div>
@@ -1721,10 +2448,10 @@ function FacultyExamsContent() {
       </div>
 
       {isLoading ? (
-        <div className="p-12 text-center text-slate-500 font-bold bg-white rounded-xl border border-slate-200 flex flex-col items-center justify-center gap-3">
-          <svg className="animate-spin h-6 w-6 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-          Syncing database...
-        </div>
+        <FullScreenLoader 
+          isOpen={isLoading} 
+          message="Loading exam management page..." 
+        />
       ) : (
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-8 w-full">
         {filteredExams.map((exam) => (
@@ -1760,23 +2487,66 @@ function FacultyExamsContent() {
                 </div>
               </div>
 
-              <div className="mt-6 pt-5 border-t border-slate-100">
-                <button
-                  onClick={() => handleExamClick(exam)}
-                  disabled={exam.status === 'Generating'}
-                  className={`w-full py-2.5 text-sm font-bold rounded-lg transition-colors shadow-sm ${
-                    exam.status === 'Generating' ? 'bg-blue-50 text-blue-400 cursor-not-allowed border border-blue-100' :
-                    exam.status === 'Pending' ? 'bg-blue-600 text-white hover:bg-blue-700' :
-                    'bg-slate-100 text-slate-700 border border-slate-200 hover:bg-slate-200'
-                  }`}
-                >
-                  {exam.status === 'Generating' ? (
-                    <span className="flex items-center justify-center gap-2">
-                      <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                      Generating AI...
-                    </span>
-                  ) : getActionLabel(exam.status)}
-                </button>
+              {/* Action Buttons Section */}
+              <div className="mt-6 pt-5 border-t border-slate-100 flex flex-col gap-2.5">
+                {exam.status === 'Generating' ? (
+                  <button
+                    disabled
+                    className="w-full py-2.5 text-sm font-bold rounded-lg transition-colors shadow-sm bg-blue-50 text-blue-400 cursor-not-allowed border border-blue-100 flex items-center justify-center gap-2"
+                  >
+                    <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    Generating AI...
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => handleOpenQuestionsOrResults(exam)}
+                      className={`w-full py-2.5 text-sm font-bold rounded-lg transition-colors shadow-sm flex items-center justify-center gap-2 ${
+                        exam.status === 'Pending'
+                          ? 'bg-blue-600 text-white hover:bg-blue-700'
+                          : 'bg-white text-blue-600 border border-blue-200 hover:bg-blue-50'
+                      }`}
+                    >
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                      </svg>
+                      {exam.status === 'Pending'
+                        ? 'Review Questions'
+                        : exam.status === 'Inactive'
+                        ? 'View Question Analytics'
+                        : 'View Questions'}
+                    </button>
+
+                    {exam.status !== 'Pending' && (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenGradebook(exam)}
+                        className="w-full py-2.5 text-sm font-bold rounded-lg transition-colors shadow-sm bg-white text-emerald-700 border border-emerald-200 hover:bg-emerald-50 flex items-center justify-center gap-2"
+                      >
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                        </svg>
+                        View Gradebook
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => handleOpenSettings(exam)}
+                      className="w-full py-2.5 text-sm font-bold rounded-lg transition-colors shadow-sm bg-slate-100 text-slate-700 border border-slate-200 hover:bg-slate-200 flex items-center justify-center gap-2"
+                    >
+                      <svg className="w-4 h-4 text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                      </svg>
+                      Manage Exam
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -1788,6 +2558,10 @@ function FacultyExamsContent() {
         )}
       </div>
       )}
+      <FullScreenLoader 
+        isOpen={isNavigating} 
+        message="Loading exam creation page..." 
+      />
     </div>
   );
 }

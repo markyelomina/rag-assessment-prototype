@@ -1,5 +1,6 @@
 'use client';
 
+import FullScreenLoader from '@/components/ui/FullScreenLoader';
 import React, { useState, useEffect, useRef } from 'react';
 import EmptyState from '@/components/ui/EmptyState';
 import { usePagination } from '@/hooks/usePagination';
@@ -30,11 +31,26 @@ interface Cohort {
   students: Student[];
 }
 
+interface PendingRemoval {
+  type: 'teacher' | 'student';
+  id: string;
+  name: string;
+  email: string;
+}
+
 export default function AdminCohortsPage() {
   const [selectedCohort, setSelectedCohort] = useState<string | null>(null);
   const [studentSearch, setStudentSearch] = useState('');
   const [cohortTab, setCohortTab] = useState('active');
-  const [isLoading, setIsLoading] = useState(true);
+  
+  // Dynamic Loading States
+  const [isLoading, setIsLoading] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [loadingMessage, setLoadingMessage] = useState('Processing...');
+
+  // Destructive Confirmation Modal & Timer States
+  const [pendingRemoval, setPendingRemoval] = useState<PendingRemoval | null>(null);
+  const [countdown, setCountdown] = useState(5);
 
   // Modals State
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -51,11 +67,22 @@ export default function AdminCohortsPage() {
   const [batchEmails, setBatchEmails] = useState('');
 
   const [cohorts, setCohorts] = useState<Cohort[]>([]);
-  const [allUsersDB, setAllUsersDB] = useState<any[]>([]); // Cache for assigning
-  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [allUsersDB, setAllUsersDB] = useState<any[]>([]);
+
+  // 5-second countdown timer effect for destructive removals
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (pendingRemoval && countdown > 0) {
+      timer = setTimeout(() => {
+        setCountdown((prev) => prev - 1);
+      }, 1000);
+    }
+    return () => clearTimeout(timer);
+  }, [pendingRemoval, countdown]);
 
   const fetchCohortsData = async () => {
     setIsLoading(true);
+    setLoadingMessage('Syncing workspace data...');
     
     // Fetch Cohorts, Users, and the new junction table
     const [cohortsRes, usersRes, teachersRes] = await Promise.all([
@@ -121,17 +148,17 @@ export default function AdminCohortsPage() {
   };
 
   const logWorkspaceAction = async (actionDesc: string, severity: string = 'Info') => {
-      const { data: sessionData } = await supabase.auth.getUser();
-      await supabase.from('AuditLogs').insert([{
-        user_email: sessionData?.user?.email || 'Unknown Admin',
-        role: 'Admin',
-        action: actionDesc,
-        type: 'Workspace Management',
-        severity,
-        ip_address: 'Internal',
-        user_agent: navigator.userAgent
-      }]);
-    };
+    const { data: sessionData } = await supabase.auth.getUser();
+    await supabase.from('AuditLogs').insert([{
+      user_email: sessionData?.user?.email || 'Unknown Admin',
+      role: 'Admin',
+      action: actionDesc,
+      type: 'Workspace Management',
+      severity,
+      ip_address: 'Internal',
+      user_agent: navigator.userAgent
+    }]);
+  };
 
   useEffect(() => {
     fetchCohortsData();
@@ -139,6 +166,7 @@ export default function AdminCohortsPage() {
 
   const handleCreateCohortSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setLoadingMessage('Creating new cohort...');
     setIsSubmitting(true);
 
     const now = new Date();
@@ -165,6 +193,7 @@ export default function AdminCohortsPage() {
 
   const handleEditCohortSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setLoadingMessage('Saving workspace details...');
     setIsSubmitting(true);
 
     const now = new Date();
@@ -192,51 +221,74 @@ export default function AdminCohortsPage() {
 
   // --- Workspace Actions ---
   const handleAssignTeacher = async (teacherId: string) => {
+    setLoadingMessage('Assigning faculty to workspace...');
+    setIsLoading(true);
     await supabase.from('Cohort Teachers').insert([{ cohort_id: selectedCohort, teacher_id: teacherId }]);
     
-    // Fetch real names directly from the DB
     const { data: teacher } = await supabase.from('Users').select('name').eq('user_id', teacherId).single();
     const { data: cohort } = await supabase.from('Cohorts').select('cohort_name').eq('cohort_id', selectedCohort).single();
     
     await logWorkspaceAction(`Assigned teacher ${teacher?.name} to cohort ${cohort?.cohort_name}`);
-    fetchCohortsData();
+    await fetchCohortsData();
+    setIsLoading(false);
   };
 
-  const handleRemoveTeacher = async (teacherId: string) => {
+  const executeRemoveTeacher = async (teacherId: string) => {
+    setLoadingMessage('Removing faculty from workspace...');
+    setIsLoading(true);
     await supabase.from('Cohort Teachers').delete().eq('cohort_id', selectedCohort).eq('teacher_id', teacherId);
     
     const { data: teacher } = await supabase.from('Users').select('name').eq('user_id', teacherId).single();
     const { data: cohort } = await supabase.from('Cohorts').select('cohort_name').eq('cohort_id', selectedCohort).single();
     
     await logWorkspaceAction(`Removed teacher ${teacher?.name} from cohort ${cohort?.cohort_name}`, 'Warning');
-    fetchCohortsData();
+    await fetchCohortsData();
+    setIsLoading(false);
   };
 
   const handleAddStudent = async (studentId: string) => {
+    setLoadingMessage('Enrolling student...');
+    setIsLoading(true);
     await supabase.from('Users').update({ cohort_id: selectedCohort }).eq('user_id', studentId);
     
     const { data: student } = await supabase.from('Users').select('name').eq('user_id', studentId).single();
     const { data: cohort } = await supabase.from('Cohorts').select('cohort_name').eq('cohort_id', selectedCohort).single();
     
     await logWorkspaceAction(`Manually enrolled student ${student?.name} into cohort ${cohort?.cohort_name}`);
-    fetchCohortsData();
+    await fetchCohortsData();
+    setIsLoading(false);
   };
 
-  const handleRemoveStudent = async (studentId: string) => {
+  const executeRemoveStudent = async (studentId: string) => {
+    setLoadingMessage('Removing student...');
+    setIsLoading(true);
     await supabase.from('Users').update({ cohort_id: null }).eq('user_id', studentId);
     
     const { data: student } = await supabase.from('Users').select('name').eq('user_id', studentId).single();
     const { data: cohort } = await supabase.from('Cohorts').select('cohort_name').eq('cohort_id', selectedCohort).single();
     
     await logWorkspaceAction(`Removed student ${student?.name} from cohort ${cohort?.cohort_name}`, 'Warning');
-    fetchCohortsData();
+    await fetchCohortsData();
+    setIsLoading(false);
+  };
+
+  const handleConfirmRemoval = async () => {
+    if (!pendingRemoval || countdown > 0) return;
+    const { type, id } = pendingRemoval;
+    setPendingRemoval(null);
+
+    if (type === 'teacher') {
+      await executeRemoveTeacher(id);
+    } else {
+      await executeRemoveStudent(id);
+    }
   };
 
   const handleBatchImport = async () => {
+    setLoadingMessage('Processing batch enrollment...');
     setIsSubmitting(true);
     const emailList = batchEmails.split(/[,\n]+/).map(e => e.trim()).filter(e => e !== '');
     
-    // Find matching students in the database
     const studentsToUpdate = allUsersDB.filter(u => u.role_id === 1 && emailList.includes(u.email));
     const userIds = studentsToUpdate.map(u => u.user_id);
 
@@ -286,10 +338,60 @@ export default function AdminCohortsPage() {
     cohortTab === 'active' ? c.account_status === 'Active' : c.account_status === 'Archived'
   );
 
-  // Available users for assignment dropdowns
   const availableTeachers = allUsersDB.filter(u => u.role_id === 2 && !currentCohort?.teachers.some(t => t.id === u.user_id));
   const availableStudents = allUsersDB.filter(u => u.role_id === 1 && u.cohort_id !== selectedCohort);
 
+  // Confirmation Modal JSX Component
+  const renderRemovalModal = () => {
+    if (!pendingRemoval) return null;
+    const isTeacher = pendingRemoval.type === 'teacher';
+
+    return (
+      <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-in fade-in duration-200">
+        <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6 border border-slate-200 text-center">
+          <div className="w-12 h-12 rounded-full bg-rose-100 text-rose-600 flex items-center justify-center mx-auto mb-4">
+            <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            </svg>
+          </div>
+          
+          <h3 className="text-lg font-bold text-slate-800 mb-2">
+            {isTeacher ? 'Remove Faculty from Cohort?' : 'Unassign Student from Cohort?'}
+          </h3>
+          <p className="text-sm text-slate-600 font-bold mb-4">
+            Are you sure you want to remove <span className="text-slate-900 font-extrabold">{pendingRemoval.name}</span> ({pendingRemoval.email}) from <span className="text-slate-900 font-extrabold">{currentCohort?.name}</span>?
+          </p>
+          <p className="text-xs text-rose-600 font-bold bg-rose-50 border border-rose-200 rounded-lg p-3 mb-6 text-left">
+            {isTeacher 
+              ? 'This teacher will immediately lose access to evaluate student attempts, view cohort analytics, and oversee mock examinations.'
+              : 'This student will immediately lose access to cohort-specific mock exams and will be unassigned until placed into a new cohort.'}
+          </p>
+
+          <div className="flex gap-3 justify-end">
+            <button
+              type="button"
+              onClick={() => setPendingRemoval(null)}
+              className="px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-bold rounded-lg transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleConfirmRemoval}
+              disabled={countdown > 0}
+              className="min-w-[170px] px-5 py-2.5 bg-rose-600 hover:bg-rose-700 disabled:bg-rose-300 text-white text-sm font-bold rounded-lg transition-colors shadow-sm disabled:cursor-not-allowed"
+            >
+              {countdown > 0 ? `Confirm in ${countdown}s` : (isTeacher ? 'Confirm Removal' : 'Confirm Unassignment')}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // ==========================================
+  // VIEW 1: INSIDE A SPECIFIC COHORT
+  // ==========================================
   if (selectedCohort !== null && currentCohort) {
     return (
       <div className="space-y-6 relative">
@@ -357,7 +459,20 @@ export default function AdminCohortsPage() {
                           <p className="text-xs font-bold text-slate-500">{teacher.email}</p>
                         </div>
                       </div>
-                      <button onClick={() => handleRemoveTeacher(teacher.id)} className="text-xs text-red-500 font-bold hover:underline">Remove</button>
+                      <button 
+                        onClick={() => {
+                          setPendingRemoval({
+                            type: 'teacher',
+                            id: teacher.id,
+                            name: teacher.name,
+                            email: teacher.email
+                          });
+                          setCountdown(5);
+                        }} 
+                        className="text-xs text-red-500 font-bold hover:underline"
+                      >
+                        Remove
+                      </button>
                     </li>
                   ))}
                 </ul>
@@ -412,7 +527,20 @@ export default function AdminCohortsPage() {
                           <p className="text-xs font-bold text-slate-500">{student.email}</p>
                         </div>
                       </div>
-                      <button onClick={() => handleRemoveStudent(student.id)} className="text-xs text-red-500 font-bold hover:underline">Remove</button>
+                      <button 
+                        onClick={() => {
+                          setPendingRemoval({
+                            type: 'student',
+                            id: student.id,
+                            name: student.name,
+                            email: student.email
+                          });
+                          setCountdown(5);
+                        }} 
+                        className="text-xs text-red-500 font-bold hover:underline"
+                      >
+                        Remove
+                      </button>
                     </li>
                   ))}
                 </ul>
@@ -511,11 +639,15 @@ export default function AdminCohortsPage() {
             </div>
           </div>
         )}
+        {renderRemovalModal()}
+        <FullScreenLoader 
+          isOpen={isLoading || isSubmitting} 
+          message={loadingMessage} 
+        />
       </div>
     );
   }
 
-  // --- Main Cohort Directory View ---
   return (
     <div className="space-y-6 relative">
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-4">
@@ -618,6 +750,11 @@ export default function AdminCohortsPage() {
           </div>
         </div>
       )}
+      {renderRemovalModal()}
+      <FullScreenLoader 
+        isOpen={isLoading || isSubmitting} 
+        message={loadingMessage} 
+      />
     </div>
   );
 }
